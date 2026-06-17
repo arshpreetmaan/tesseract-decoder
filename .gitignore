@@ -39,3 +39,4 @@ user.bazelrc
 src/tesseract_decoder*.so
 
 MODULE.bazel.lock
+/venv/
