@@ -233,22 +233,126 @@ def gari_transform(H: csc_matrix, L: csc_matrix, det_types: np.ndarray, priors: 
     ]
     gari_obs_matrix = bmat(L_blocks, format='csc', dtype=np.uint8)
     
-    # Priors
     P_ez = P_dx
     P_ex = P_dz
     P_ey = P_y
     
-    P_ez_prime = P_ez + U @ P_ey
-    P_ex_prime = P_ex + V @ P_ey
+    print("\n--- Physical Priors (From Stim) ---")
+    print(f"P_ez (Hidden Z): min={np.min(P_ez):.2e}, max={np.max(P_ez):.2e}, mean={np.mean(P_ez):.2e}")
+    print(f"P_ex (Hidden X): min={np.min(P_ex):.2e}, max={np.max(P_ex):.2e}, mean={np.mean(P_ex):.2e}")
+    if len(P_ey) > 0:
+        print(f"P_ey (Hidden Y): min={np.min(P_ey):.2e}, max={np.max(P_ey):.2e}, mean={np.mean(P_ey):.2e}")
+    else:
+        print("P_ey (Hidden Y): None")
+    print("-----------------------------------")
     
-    gari_priors = np.concatenate([P_ez, P_ex, P_ey, P_ez_prime, P_ex_prime])
+    # --- Legacy Aggregated Priors ---
+    P_ez_prime_agg = P_ez + U @ P_ey
+    P_ex_prime_agg = P_ex + V @ P_ey
+    gari_priors_agg = np.concatenate([P_ez, P_ex, P_ey, P_ez_prime_agg, P_ex_prime_agg])
+    
+    # --- Helper Functions ---
+    def cost(p):
+        p = np.clip(p, 1e-15, 1 - 1e-15)
+        return np.log((1-p)/p)
+    def prob(c):
+        c = np.clip(c, -30, 30)
+        return 1 / (1 + np.exp(c))
+
+    # --- Mode B: ez,ex,ey Keep, ez',ex' Free ---
+    gari_priors_keep_free = np.concatenate([
+        P_ez, P_ex, P_ey,
+        np.full_like(P_ez, 0.499),
+        np.full_like(P_ex, 0.499)
+    ])
+
+    # --- Mode C: ez,ex,ey Keep, ez',ex' Scaled from Agg ---
+    lam = 0.05
+    C_z_prime_agg = cost(P_ez_prime_agg)
+    C_x_prime_agg = cost(P_ex_prime_agg)
+    gari_priors_keep_scaled = np.concatenate([
+        P_ez, P_ex, P_ey,
+        prob(lam * C_z_prime_agg),
+        prob(lam * C_x_prime_agg)
+    ])
+
+    # --- Mode D: ez,ex,ey Free, ez',ex' Penalized ---
+    gari_priors_hidden_free = np.concatenate([
+        np.full_like(P_ez, 0.499), 
+        np.full_like(P_ex, 0.499), 
+        np.full_like(P_ey, 0.499), 
+        P_ez, P_ex
+    ])
+
+    # --- Mode E: ez,ex,ey Scaled, ez',ex' Penalized ---
+    C_z = cost(P_ez)
+    C_x = cost(P_ex)
+    C_y = cost(P_ey)
+    gari_priors_tiny = np.concatenate([
+        prob(lam * C_z), 
+        prob(lam * C_x), 
+        prob(lam * C_y), 
+        P_ez, P_ex
+    ])
+    
+    # --- Mode F: ez,ex,ey Free, ez',ex' Aggregated ---
+    gari_priors_hf_agg = np.concatenate([
+        np.full_like(P_ez, 0.499), 
+        np.full_like(P_ex, 0.499), 
+        np.full_like(P_ey, 0.499), 
+        P_ez_prime_agg, P_ex_prime_agg
+    ])
+
+    # --- Mode G: ez,ex,ey Scaled, ez',ex' Aggregated ---
+    gari_priors_tiny_agg = np.concatenate([
+        prob(lam * C_z), 
+        prob(lam * C_x), 
+        prob(lam * C_y), 
+        P_ez_prime_agg, P_ex_prime_agg
+    ])
+
+    # --- Mode H: ez,ex,ey Keep, ez',ex' Keep ---
+    gari_priors_keep_keep = np.concatenate([
+        P_ez, P_ex, P_ey, 
+        P_ez, P_ex
+    ])
+
+    U_weighted = U.multiply(P_ey)
+    max_ey_to_z = U_weighted.max(axis=1).toarray().flatten()
+    P_ez_prime_max = np.maximum(P_ez, max_ey_to_z)
+
+    V_weighted = V.multiply(P_ey)
+    max_ey_to_x = V_weighted.max(axis=1).toarray().flatten()
+    P_ex_prime_max = np.maximum(P_ex, max_ey_to_x)
+
+    # --- Mode I: ez,ex,ey Keep, ez',ex' Maxed ---
+    gari_priors_keep_max = np.concatenate([
+        P_ez, P_ex, P_ey, 
+        P_ez_prime_max, P_ex_prime_max
+    ])
+
+    # --- Mode J: ez,ex,ey Free, ez',ex' Maxed ---
+    gari_priors_hf_max = np.concatenate([
+        np.full_like(P_ez, 0.499), 
+        np.full_like(P_ex, 0.499), 
+        np.full_like(P_ey, 0.499), 
+        P_ez_prime_max, P_ex_prime_max
+    ])
+
+    # --- Mode K: ez,ex,ey Scaled, ez',ex' Maxed ---
+    gari_priors_tiny_max = np.concatenate([
+        prob(lam * C_z), 
+        prob(lam * C_x), 
+        prob(lam * C_y), 
+        P_ez_prime_max, P_ex_prime_max
+    ])
     
     time_vx = [np.max(hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else 0 for c in i_hx_only]
     time_vz = [np.max(hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else 0 for c in i_hz_only]
     
     if return_dem:
-        return matrices_to_dem(gari_matrix, gari_obs_matrix, gari_priors), nx, nz, time_vx, time_vz
-    return gari_matrix, gari_obs_matrix, gari_priors, dx, dz, nx, nz, time_vx, time_vz
+        return matrices_to_dem(gari_matrix, gari_obs_matrix, gari_priors_agg), nx, nz, time_vx, time_vz
+    return gari_matrix, gari_obs_matrix, gari_priors_agg, gari_priors_keep_free, gari_priors_keep_scaled, gari_priors_hidden_free, gari_priors_tiny, gari_priors_hf_agg, gari_priors_tiny_agg, gari_priors_keep_keep, gari_priors_keep_max, gari_priors_hf_max, gari_priors_tiny_max, dx, dz, nx, nz, time_vx, time_vz
 
 
 def set_prior_to_half(p_arr):
@@ -257,7 +361,7 @@ def set_prior_to_half(p_arr):
 
 def plot_gari_structure():
     print("Loading circuit d=3, r=3 for plotting...")
-    circuit = load_circuit("surfacecodes", d=3, r=3, p=0.001, obs_basis='Z')
+    circuit = load_circuit("surfacecodes", d=7, r=7, p=0.001, obs_basis='Z')
     dem = circuit.detector_error_model()
     
     H, L, priors, _ = dem_to_check_matrices(dem)
@@ -390,21 +494,54 @@ def get_gari_orderings(dem, gari_dem, dx, dz, det_types, nx_virt):
     order_2 = real_x_gari + real_z_gari + virt_x_gari + virt_z_gari
     order_3 = real_x_gari + virt_z_gari + real_z_gari + virt_x_gari
     order_4 = real_x_gari + real_z_gari + virt_z_gari + virt_x_gari
+    order_8 = real_x_gari + virt_x_gari + virt_z_gari + real_z_gari
+
+
+    # Option 7: Chronological Real, Chronological Virtual
+    real_gari_chronological = []
+    for orig_idx in range(dem.num_detectors):
+        if orig_idx in x_orig_indices:
+            gari_idx = np.where(x_orig_indices == orig_idx)[0][0]
+            real_gari_chronological.append(int(gari_idx))
+        elif orig_idx in z_orig_indices:
+            gari_idx = np.where(z_orig_indices == orig_idx)[0][0]
+            real_gari_chronological.append(int(nx_real + gari_idx))
+            
+    virt_with_time = []
+    for c in range(dx.shape[1]):
+        start = dx.indptr[c]
+        end = dx.indptr[c+1]
+        max_t = max([x_orig_indices[r] for r in dx.indices[start:end]]) if start < end else 0
+        virt_with_time.append((max_t, nx_real + nz_real + c))
+    for c in range(dz.shape[1]):
+        start = dz.indptr[c]
+        end = dz.indptr[c+1]
+        max_t = max([z_orig_indices[r] for r in dz.indices[start:end]]) if start < end else 0
+        virt_with_time.append((max_t, nx_real + nz_real + nx_virt + c))
+        
+    virt_with_time.sort(key=lambda x: x[0])
+    virt_gari_chronological = [v[1] for v in virt_with_time]
+    
+    order_7 = real_gari_chronological + virt_gari_chronological
 
     return {
-        "Option 1  (RealX, VirtX, RealZ, VirtZ)": order_1,
+        # "Option 1  (RealX, VirtX, RealZ, VirtZ)": order_1,
         "Option 2  (RealX, RealZ, VirtX, VirtZ)": order_2,
-        "Option 3  (RealX, VirtZ, RealZ, VirtX)": order_3,
+        # "Option 3  (RealX, VirtZ, RealZ, VirtX)": order_3,
         "Option 4  (RealX, RealZ, VirtZ, VirtX)": order_4,
-        "Option 5  (First-Touch Interleaved)": order_5,
-        "Option 6  (Last-Touch Interleaved)": order_6
+        # "Option 5  (First-Touch Interleaved)": order_5,
+        # "Option 6  (Last-Touch Interleaved)": order_6,
+        "Option 7  (Chrono Real, Chrono Virt)": order_7,
+        # "Option 8  (RealX, VirtX, VirtZ, RealZ)": order_8,
     }
 
 def test_gari_transform():
     print("Reading Circuit...")
 
-    circuit = load_circuit("surfacecodes", d=7, r=7, p=0.001, obs_basis='Z')
-    # circuit = load_circuit("bivariatebicyclecodes", d=6, r=6, p=0.001, obs_basis='Z')
+    circuit = load_circuit("surfacecodes", d=9, r=9, p=0.001, obs_basis='Z')
+    # circuit = load_circuit("bivariatebicyclecodes", d=12, r=12, p=0.002, obs_basis='Z')
+    # circuit = load_circuit("colorcodes", d=11, r=11, p=0.001, obs_basis='Z')
+
     dem = circuit.detector_error_model()
     print("Extracting DEM...")
     dem = circuit.detector_error_model(
@@ -435,10 +572,22 @@ def test_gari_transform():
     # print(f"Gari Priors Shape: {priors_gari.shape}")
     
     print("Applying Gari Transform (return_dem=False)...")
-    gari_matrix, gari_obs_matrix, gari_priors, dx, dz, nx_virt, nz_virt, time_vx, time_vz = gari_transform(H, L, det_types, priors, return_dem=False)
-    gari_dem = matrices_to_dem(gari_matrix, gari_obs_matrix, gari_priors)
+    gari_matrix, gari_obs_matrix, p_agg, p_keep_free, p_keep_scaled, p_hf, p_tiny, p_hf_agg, p_tiny_agg, p_keep_keep, p_keep_max, p_hf_max, p_tiny_max, dx, dz, nx_virt, nz_virt, time_vx, time_vz = gari_transform(H, L, det_types, priors, return_dem=False)
+    
+    dem_agg = matrices_to_dem(gari_matrix, gari_obs_matrix, p_agg)
+    dem_keep_free = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_free)
+    dem_keep_scaled = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_scaled)
+    dem_hf = matrices_to_dem(gari_matrix, gari_obs_matrix, p_hf)
+    dem_tiny = matrices_to_dem(gari_matrix, gari_obs_matrix, p_tiny)
+    dem_hf_agg = matrices_to_dem(gari_matrix, gari_obs_matrix, p_hf_agg)
+    dem_tiny_agg = matrices_to_dem(gari_matrix, gari_obs_matrix, p_tiny_agg)
+    dem_keep_keep = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_keep)
+    dem_keep_max = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_max)
+    dem_hf_max = matrices_to_dem(gari_matrix, gari_obs_matrix, p_hf_max)
+    dem_tiny_max = matrices_to_dem(gari_matrix, gari_obs_matrix, p_tiny_max)
+    
     print(f"Gari Matrix Shape: {gari_matrix.shape}")
-    print(f"Gari DEM has {gari_dem.num_detectors} detectors and {gari_dem.num_errors} errors.")
+    print(f"Gari DEM has {dem_agg.num_detectors} detectors and {dem_agg.num_errors} errors.")
     
     orig_row_weights = np.sum(H.toarray(), axis=1)
     
@@ -456,62 +605,74 @@ def test_gari_transform():
     if has_tesseract:
         print("\n--- Running Tesseract Decoder Comparison ---")
 
-        num_shots = 10
+        num_shots = 100
         sampler = circuit.compile_detector_sampler(seed=0)
         shots, obs_shots = sampler.sample(shots=num_shots, separate_observables=True)
         
         sinter_decoders = make_tesseract_sinter_decoders_dict()
-        short_beam_decoder_obj = sinter_decoders["tesseract-short-beam"]
-        # short_beam_decoder_obj = sinter_decoders["tesseract-long-beam"]
+        # short_beam_decoder_obj = sinter_decoders["tesseract-short-beam"]
+        short_beam_decoder_obj = sinter_decoders["tesseract-long-beam"]
         base_config = short_beam_decoder_obj.compile_decoder_for_dem(dem=dem).decoder.config
         base_config.det_orders = [list(range(dem.num_detectors))]
-        decoder = tesseract.TesseractDecoder(base_config)
-        print(f"det_order_method: {short_beam_decoder_obj.det_order_method}")
-        print(f"seed: {short_beam_decoder_obj.seed}")
+        decoder_orig = tesseract.TesseractDecoder(base_config)
+        # print(f"det_order_method: {short_beam_decoder_obj.det_order_method}")
+        # print(f"seed: {short_beam_decoder_obj.seed}")
         
-        print("\nCompiling Tesseract for Original DEM...")
-        decoder_orig = short_beam_decoder_obj.compile_decoder_for_dem(dem=dem).decoder
+        print("\nCompiling Tesseract for Original DEM (Forced 1 Order)...")
+        base_config.det_orders = [list(range(dem.num_detectors))]
+        decoder_orig = tesseract.TesseractDecoder(base_config)
         
-        print("Decoding Original DEM...")
+        print("Decoding Original DEM (1 Order)...")
         start_time = time.time()
         predicted_obs_orig = decoder_orig.decode_batch(shots)
         time_orig = time.time() - start_time
         
         correct_orig = np.sum(np.all(predicted_obs_orig == obs_shots, axis=1))
-        print(f"Original DEM: {correct_orig}/{num_shots} correct, Time: {time_orig:.4f}s")
+        print(f"Original DEM (1 Order): {correct_orig}/{num_shots} correct, Time: {time_orig:.4f}s")
         
         # We will test native orderings after gari_shots is defined!
         
-        orders = get_gari_orderings(dem, gari_dem, dx, dz, det_types, nx_virt)
+        orders = get_gari_orderings(dem, dem_agg, dx, dz, det_types, nx_virt)
         
         # Pad and align shots for Gari DEM
         is_x_det = (det_types == 1)
         is_z_det = (det_types == 3)
-        num_virtual = gari_dem.num_detectors - dem.num_detectors
+        num_virtual = dem_agg.num_detectors - dem.num_detectors
         x_shots = shots[:, is_x_det]
         z_shots = shots[:, is_z_det]
         virtual_shots = np.zeros((num_shots, num_virtual), dtype=bool)
         gari_shots = np.concatenate([x_shots, z_shots, virtual_shots], axis=1)
         
         prior_modes = {
-            "Aggregated Priors (Double-Counted)": gari_dem
+            # "Mode A: Aggregated (Original Double-Count)": dem_agg,
+            # "Mode B: ez,ex,ey Keep, ez',ex' Free (0.499)": dem_keep_free,
+            # "Mode C: ez,ex,ey Keep, ez',ex' Scaled (0.05x)": dem_keep_scaled,
+            "Mode D: ez,ex,ey Free (0.499), ez',ex' Penalized": dem_hf,
+            # "Mode E: ez,ex,ey Scaled (0.05x), ez',ex' Penalized": dem_tiny,
+            "Mode F: ez,ex,ey Free (0.499), ez',ex' Aggregated": dem_hf_agg,
+            "Mode G: ez,ex,ey Scaled (0.05x), ez',ex' Aggregated": dem_tiny_agg,
+            # "Mode H: ez,ex,ey Keep, ez',ex' Keep": dem_keep_keep,
+            # "Mode I: ez,ex,ey Keep, ez',ex' Maxed": dem_keep_max,
+            "Mode J: ez,ex,ey Free, ez',ex' Maxed": dem_hf_max,
+            # "Mode K: ez,ex,ey Scaled, ez',ex' Maxed": dem_tiny_max
         }
-
-        print("\nTesting Custom Orderings on Gari DEM ...")
-        for prior_name, target_dem in prior_modes.items():
-            print(f"\n--- USING PRIORS: {prior_name} ---")
+        
+        print("\nTesting Priority Modes on Gari DEM ...")
+        
+        for mode_name, target_dem in prior_modes.items():
+            print(f"\n>> {mode_name}")
             for name, order in orders.items():
                 base_gari_config = short_beam_decoder_obj.compile_decoder_for_dem(dem=target_dem).decoder.config
                 base_gari_config.det_orders = [order]
+                base_gari_config.no_revisit_dets = False
+
                 decoder_gari = tesseract.TesseractDecoder(base_gari_config)
                 
                 start_time = time.time()
                 predicted_obs_gari = decoder_gari.decode_batch(gari_shots)
                 time_gari = time.time() - start_time
-                
                 correct_gari = np.sum(np.all(predicted_obs_gari == obs_shots, axis=1))
-                print(f"{name:<45} | {correct_gari}/{num_shots} correct | {time_gari:.4f}s")
-
+                print(f"{name[:30]:30s} | {correct_gari}/{num_shots} correct | {time_gari:.4f}s")
 
 
 if __name__ == "__main__":
