@@ -40,3 +40,5 @@ src/tesseract_decoder*.so
 
 MODULE.bazel.lock
 /venv/
+/benchmarking/sparsify_errors/plots/
+/benchmarking/gari/plots/
