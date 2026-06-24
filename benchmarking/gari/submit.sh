@@ -25,37 +25,72 @@ for num in $(seq 0 999); do
     done
   done
 done | shuf | while read circuit; do
-  
-  # Determine base degree based on the folder/filename
-  if [[ "$circuit" == *"surfacecodes"* ]]; then
-    SPARSIFY_BASE_DEGREE=2
-  else
-    SPARSIFY_BASE_DEGREE=3
-  fi
+  circuit_dir=$(dirname "$circuit")
+  circuit_name=$(basename "$circuit" .stim)
+  mapping_file="$circuit_dir/gari/${circuit_name}_mapping.json"
 
-  # Iterate through the requested reactivate limits
-  for SPARSIFY_REACTIVATE_LIMIT in 0 2 4 8 16 32 64 128 256 512 1024 2048 4096 8192; do
-    
-    echo "Submitting: $circuit | Degree: $SPARSIFY_BASE_DEGREE | Limit: $SPARSIFY_REACTIVATE_LIMIT"
+  echo "========================================="
+  echo "Running benchmark for circuit: $circuit_name"
 
-    sbatch --partition=c2 --job-name=None4u \
-            --ntasks=1 \
-            --mem=120gb \
-            --cpus-per-task=60 \
-            --time=200:00:00 \
-            --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --max-errors 10 --threads 30 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --sparsify-errors --sparsify-base-degree $SPARSIFY_BASE_DEGREE --sparsify-reactivate-limit $SPARSIFY_REACTIVATE_LIMIT --stats-out out/${STARTTIME}-${COUNTER}.json"
-    
-    # Increment counter for every single job so JSON files don't get overwritten
-    COUNTER=$((COUNTER + 1))
-  done
-
-  # Submit also one baseline job
-  sbatch --partition=c2 --job-name=None4u \
+  # Baseline 1
+  sbatch --partition=c2 --job-name=gari \
           --ntasks=1 \
           --mem=120gb \
           --cpus-per-task=60 \
           --time=200:00:00 \
-          --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --max-errors 10 --threads 30 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}.json"
-  # Increment counter for every single job so JSON files don't get overwritten
+          --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 1 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-1det.json"
   COUNTER=$((COUNTER + 1))
+
+  # Baseline 2
+  sbatch --partition=c2 --job-name=gari \
+          --ntasks=1 \
+          --mem=120gb \
+          --cpus-per-task=60 \
+          --time=200:00:00 \
+          --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-21det.json"
+  COUNTER=$((COUNTER + 1))
+
+  # # Baseline 3
+  # sbatch --partition=c2 --job-name=gari \
+  #         --ntasks=1 \
+  #         --mem=120gb \
+  #         --cpus-per-task=60 \
+  #         --time=200:00:00 \
+  #         --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --no-revisit-dets --beam 5 --beam-climbing --num-det-orders 1 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-5beam-1det.json"
+  # COUNTER=$((COUNTER + 1))
+
+  # # Baseline 4
+  # sbatch --partition=c2 --job-name=gari \
+  #         --ntasks=1 \
+  #         --mem=120gb \
+  #         --cpus-per-task=60 \
+  #         --time=200:00:00 \
+  #         --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --no-revisit-dets --beam 5 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-5beam-21det.json"
+  # COUNTER=$((COUNTER + 1))
+
+  # GARI Runs
+  for mode in modeA modeC modeI modeK modeN modeO; do
+    dem_file="$circuit_dir/gari/${circuit_name}_${mode}.dem"
+    echo "Running GARI mode: $dem_file"
+    for order in order2 order4 order7 order7a order7b order7c order9 order10 all; do
+      echo "  Running order: $order"
+      
+      sbatch --partition=c2 --job-name=gari \
+              --ntasks=1 \
+              --mem=120gb \
+              --cpus-per-task=60 \
+              --time=200:00:00 \
+              --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --beam 5 --beam-climbing --num-det-orders 1 --pqlimit 1000000 --dem \"$dem_file\" --det-mapping-file \"$mapping_file\" --custom-order \"$order\" --stats-out out/${STARTTIME}-${COUNTER}-gari-${mode}-${order}-revisit_beam5.json"
+      COUNTER=$((COUNTER + 1))
+
+      sbatch --partition=c2 --job-name=gari \
+              --ntasks=1 \
+              --mem=120gb \
+              --cpus-per-task=60 \
+              --time=200:00:00 \
+              --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --beam 20 --beam-climbing --num-det-orders 1 --pqlimit 1000000 --dem \"$dem_file\" --det-mapping-file \"$mapping_file\" --custom-order \"$order\" --stats-out out/${STARTTIME}-${COUNTER}-gari-${mode}-${order}-revisit_beam20.json"
+      COUNTER=$((COUNTER + 1))
+
+    done
+  done
 done

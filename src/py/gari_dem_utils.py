@@ -349,6 +349,12 @@ def gari_transform(H: csc_matrix, L: csc_matrix, det_types: np.ndarray, priors: 
         P_ez_prime_xor, P_ex_prime_xor
     ])
     
+    # --- Mode O: ez, ex, ey Scaled, ez', ex' XOR Aggregated ---
+    gari_priors_scaled_xor = np.concatenate([
+        prob(lam * C_z), prob(lam * C_x), prob(lam * C_y),
+        P_ez_prime_xor, P_ex_prime_xor
+    ])
+    
     time_vy = [max(
         np.max(hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else 0,
         np.max(hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else 0
@@ -396,7 +402,7 @@ def gari_transform(H: csc_matrix, L: csc_matrix, det_types: np.ndarray, priors: 
     
     if return_dem:
         return matrices_to_dem(gari_matrix, gari_obs_matrix, gari_priors_agg), nx, nz, time_vx_old, time_vz_old, gari_obs_matrix_og, time_vx_new, time_vz_new, time_vx_min_old, time_vz_min_old, time_vx_min_new, time_vz_min_new
-    return gari_matrix, gari_obs_matrix, gari_priors_agg, gari_priors_keep_free, gari_priors_keep_scaled, gari_priors_hidden_free, gari_priors_tiny, gari_priors_hf_agg, gari_priors_tiny_agg, gari_priors_keep_keep, gari_priors_keep_max, gari_priors_hf_max, gari_priors_tiny_max, gari_priors_keep_freeY_agg, gari_priors_keep_freeY_max, gari_priors_keep_xor, dx, dz, nx, nz, time_vx_old, time_vz_old, gari_obs_matrix_og, time_vx_new, time_vz_new, time_vx_min_old, time_vz_min_old, time_vx_min_new, time_vz_min_new
+    return gari_matrix, gari_obs_matrix, gari_priors_agg, gari_priors_keep_free, gari_priors_keep_scaled, gari_priors_hidden_free, gari_priors_tiny, gari_priors_hf_agg, gari_priors_tiny_agg, gari_priors_keep_keep, gari_priors_keep_max, gari_priors_hf_max, gari_priors_tiny_max, gari_priors_keep_freeY_agg, gari_priors_keep_freeY_max, gari_priors_keep_xor, gari_priors_scaled_xor, dx, dz, nx, nz, time_vx_old, time_vz_old, gari_obs_matrix_og, time_vx_new, time_vz_new, time_vx_min_old, time_vz_min_old, time_vx_min_new, time_vz_min_new
 
 def get_gari_orderings(dem, gari_dem, dx, dz, det_types, nx_virt, time_vx_old, time_vz_old, time_vx_new, time_vz_new, time_vx_min_old, time_vz_min_old, time_vx_min_new, time_vz_min_new):
     """
@@ -583,7 +589,7 @@ def process_directory(input_path):
             
             gari_matrix = res[0]
             gari_obs_matrix = res[1]
-            gari_obs_matrix_og = res[22]
+            gari_obs_matrix_og = res[23]
             
             stim_dir = os.path.dirname(stim_path)
             stim_stem = os.path.splitext(os.path.basename(stim_path))[0]
@@ -603,7 +609,8 @@ def process_directory(input_path):
                 "modeK": 12,
                 "modeL": 13,
                 "modeM": 14,
-                "modeN": 15
+                "modeN": 15,
+                "modeO": 16
             }
             
             for mode_name, index in modes_to_generate.items():
@@ -628,7 +635,7 @@ def process_directory(input_path):
                 mapping[int(orig_idx)] = int(nx + gari_idx)
                 
             dummy_dem = matrices_to_dem(res[0], res[1], res[2])
-            orderings = get_gari_orderings(dem, dummy_dem, res[16], res[17], det_types, res[18], res[20], res[21], res[23], res[24], res[25], res[26], res[27], res[28])
+            orderings = get_gari_orderings(dem, dummy_dem, res[17], res[18], det_types, res[19], res[21], res[22], res[24], res[25], res[26], res[27], res[28], res[29])
             
             det_orders_clean = {}
             for k, v in orderings.items():
