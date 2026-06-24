@@ -38,7 +38,7 @@ done | shuf | while read circuit; do
           --mem=120gb \
           --cpus-per-task=60 \
           --time=200:00:00 \
-          --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 1 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-1det.json"
+          --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --max-errors 10 --threads 30 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 1 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-1det.json"
   COUNTER=$((COUNTER + 1))
 
   # Baseline 2
@@ -47,7 +47,7 @@ done | shuf | while read circuit; do
           --mem=120gb \
           --cpus-per-task=60 \
           --time=200:00:00 \
-          --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-21det.json"
+          --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --max-errors 10 --threads 30 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-21det.json"
   COUNTER=$((COUNTER + 1))
 
   # # Baseline 3
@@ -56,7 +56,7 @@ done | shuf | while read circuit; do
   #         --mem=120gb \
   #         --cpus-per-task=60 \
   #         --time=200:00:00 \
-  #         --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --no-revisit-dets --beam 5 --beam-climbing --num-det-orders 1 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-5beam-1det.json"
+  #         --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --max-errors 10 --threads 30 --no-revisit-dets --beam 5 --beam-climbing --num-det-orders 1 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-5beam-1det.json"
   # COUNTER=$((COUNTER + 1))
 
   # # Baseline 4
@@ -65,7 +65,7 @@ done | shuf | while read circuit; do
   #         --mem=120gb \
   #         --cpus-per-task=60 \
   #         --time=200:00:00 \
-  #         --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --no-revisit-dets --beam 5 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-5beam-21det.json"
+  #         --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --max-errors 10 --threads 30 --no-revisit-dets --beam 5 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --stats-out out/${STARTTIME}-${COUNTER}-baseline-5beam-21det.json"
   # COUNTER=$((COUNTER + 1))
 
   # GARI Runs
@@ -80,7 +80,7 @@ done | shuf | while read circuit; do
               --mem=120gb \
               --cpus-per-task=60 \
               --time=200:00:00 \
-              --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --beam 5 --beam-climbing --num-det-orders 1 --pqlimit 1000000 --dem \"$dem_file\" --det-mapping-file \"$mapping_file\" --custom-order \"$order\" --stats-out out/${STARTTIME}-${COUNTER}-gari-${mode}-${order}-revisit_beam5.json"
+              --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --max-errors 10 --threads 30 --beam 5 --beam-climbing --num-det-orders 1 --pqlimit 1000000 --dem \"$dem_file\" --det-mapping-file \"$mapping_file\" --custom-order \"$order\" --stats-out out/${STARTTIME}-${COUNTER}-gari-${mode}-${order}-revisit_beam5.json"
       COUNTER=$((COUNTER + 1))
 
       sbatch --partition=c2 --job-name=gari \
@@ -88,7 +88,7 @@ done | shuf | while read circuit; do
               --mem=120gb \
               --cpus-per-task=60 \
               --time=200:00:00 \
-              --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --sample-seed 0 --max-errors 10 --threads 30 --beam 20 --beam-climbing --num-det-orders 1 --pqlimit 1000000 --dem \"$dem_file\" --det-mapping-file \"$mapping_file\" --custom-order \"$order\" --stats-out out/${STARTTIME}-${COUNTER}-gari-${mode}-${order}-revisit_beam20.json"
+              --wrap="$TESSERACT_BIN --circuit \"$circuit\" --sample-num-shots 10000 --max-errors 10 --threads 30 --beam 20 --beam-climbing --num-det-orders 1 --pqlimit 1000000 --dem \"$dem_file\" --det-mapping-file \"$mapping_file\" --custom-order \"$order\" --stats-out out/${STARTTIME}-${COUNTER}-gari-${mode}-${order}-revisit_beam20.json"
       COUNTER=$((COUNTER + 1))
 
     done

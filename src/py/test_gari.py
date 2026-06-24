@@ -83,9 +83,9 @@ def test_gari_transform():
     gari_matrix, gari_obs_matrix = res[0], res[1]
     p_agg, p_keep_free, p_keep_scaled, p_hf, p_tiny = res[2], res[3], res[4], res[5], res[6]
     p_hf_agg, p_tiny_agg, p_keep_keep, p_keep_max = res[7], res[8], res[9], res[10]
-    p_hf_max, p_tiny_max, p_keep_freeY_agg, p_keep_freeY_max, p_keep_xor = res[11], res[12], res[13], res[14], res[15]
-    dx, dz, nx_virt, nz_virt, time_vx, time_vz = res[16], res[17], res[18], res[19], res[20], res[21]
-    gari_obs_matrix_og = res[22]
+    p_hf_max, p_tiny_max, p_keep_freeY_agg, p_keep_freeY_max, p_keep_xor, p_scaled_xor = res[11], res[12], res[13], res[14], res[15], res[16]
+    dx, dz, nx_virt, nz_virt, time_vx, time_vz = res[17], res[18], res[19], res[20], res[21], res[22]
+    gari_obs_matrix_og = res[23]
     
     dem_agg = matrices_to_dem(gari_matrix, gari_obs_matrix, p_agg)
     dem_keep_free = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_free)
@@ -101,6 +101,7 @@ def test_gari_transform():
     dem_keep_freeY_agg = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_freeY_agg)
     dem_keep_freeY_max = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_freeY_max)
     dem_hf_xor = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_xor)
+    dem_scaled_xor = matrices_to_dem(gari_matrix, gari_obs_matrix, p_scaled_xor)
     
     print(f"Gari Matrix Shape: {gari_matrix.shape}")
     print(f"Gari DEM has {dem_agg.num_detectors} detectors and {dem_agg.num_errors} errors.")
@@ -148,7 +149,7 @@ def test_gari_transform():
         
         # We will test native orderings after gari_shots is defined!
         
-        orders = get_gari_orderings(dem, dem_agg, dx, dz, det_types, nx_virt)
+        orders = get_gari_orderings(dem, dem_agg, res[17], res[18], det_types, res[19], res[21], res[22], res[24], res[25], res[26], res[27], res[28], res[29])
         
         # Pad and align shots for Gari DEM
         is_x_det = (det_types == 1)
@@ -171,7 +172,8 @@ def test_gari_transform():
             "Mode I: ez,ex,ey Keep, ez',ex' Maxed": dem_keep_max,
             # "Mode J: ez,ex,ey Free, ez',ex' Maxed": dem_hf_max,
             # "Mode K: ez,ex,ey Scaled, ez',ex' Maxed": dem_tiny_max
-            "Mode N: ez,ex,ey Keep, ez',ex' XOR Aggregated": dem_hf_xor
+            "Mode N: ez,ex,ey Keep, ez',ex' XOR Aggregated": dem_hf_xor,
+            "Mode O: ez,ex,ey Scaled, ez',ex' XOR Aggregated": dem_scaled_xor
         }
         
         print("\nTesting Priority Modes on Gari DEM ...")
