@@ -699,6 +699,8 @@ int main(int argc, char* argv[]) {
     nlohmann::json stats_json = {
         {"circuit_path", args.circuit_path},
         {"dem_path", args.dem_path},
+        {"custom_order", args.custom_order},
+        {"det_mapping_file", args.det_mapping_file},
         {"max_errors", args.max_errors},
         {"sample_seed", args.sample_seed},
 
