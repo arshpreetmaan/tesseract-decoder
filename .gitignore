@@ -42,3 +42,7 @@ MODULE.bazel.lock
 /venv/
 /benchmarking/sparsify_errors/plots/
 /benchmarking/gari/plots/
+/out/
+testdata/**/gari/
+*_mapping.json
+*mode*.dem
