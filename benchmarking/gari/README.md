@@ -1,8 +1,5 @@
-# Error sparsification benchmarks
+# GARI benchmarks
 
-This directory preserves the benchmarking artifacts used for
-[PR #254](https://github.com/quantumlib/tesseract-decoder/pull/254), which
-introduced `--sparsify-errors`.
 
 ## Contents
 
