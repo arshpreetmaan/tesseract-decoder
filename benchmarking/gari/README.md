@@ -29,7 +29,7 @@ The gari_dem_utils requires `numpy`,`scipy`, and `stim`.
 From the repository root:
 
 ```bash
-benchmarking/sparsify_errors/submit.sh
+benchmarking/gari/submit.sh
 ```
 
 The script assumes the Tesseract binary is available at
