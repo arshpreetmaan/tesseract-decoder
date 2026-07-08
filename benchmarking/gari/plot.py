@@ -62,7 +62,11 @@ def process_data(filepath):
             if m_mode:
                 mode = m_mode.group(1)
             
-            key = (p_val, c_type, d_val, q_val, r_val, operator_type, mode, custom_order, beam, num_det_orders, is_baseline)
+            sparsify_errors = row.get('sparsify_errors', False)
+            sparsify_reactivate_limit = row.get('sparsify_reactivate_limit', -1)
+            beam_climbing = row.get('beam_climbing', True)
+            
+            key = (p_val, c_type, d_val, q_val, r_val, operator_type, mode, custom_order, beam, num_det_orders, is_baseline, sparsify_errors, sparsify_reactivate_limit, beam_climbing)
             
             if key not in data_groups:
                 data_groups[key] = {
@@ -80,7 +84,7 @@ def process_data(filepath):
 def compute_metrics(data_groups):
     metrics = []
     for key, agg in data_groups.items():
-        p_val, c_type, d_val, q_val, r_val, op_type, mode, order, beam, num_det_orders, is_baseline = key
+        p_val, c_type, d_val, q_val, r_val, op_type, mode, order, beam, num_det_orders, is_baseline, sparsify_errors, sparsify_reactivate_limit, beam_climbing = key
         shots = agg['num_shots']
         if shots == 0: continue
             
@@ -100,19 +104,31 @@ def compute_metrics(data_groups):
             'p': p_val, 'type': c_type, 'd': d_val, 'q': q_val, 'r': r_val, 
             'op_type': op_type, 'mode': mode, 'order': order, 'beam': beam, 
             'num_det_orders': num_det_orders, 'is_baseline': is_baseline,
+            'sparsify_errors': sparsify_errors, 'sparsify_reactivate_limit': sparsify_reactivate_limit,
+            'beam_climbing': beam_climbing,
             'ler': p_raw / r_val,
             'ler_err_low': ler_err_low,
             'ler_err_high': ler_err_high,
             'time_per_round': time_sec / shots / r_val,
-            'shots': shots
+            'shots': shots,
+            'num_low_confidence': agg['num_low_confidence']
         })
     return metrics
 
-def format_gari_label(mode, order, beam):
+def format_gari_label(mode, order, beam, beam_climbing=True, sparsify_errors=False, sparsify_reactivate_limit=-1):
     m_str = mode.replace('mode', '')
     o_str = order.replace('order', '')
     beam_str = 'lb' if beam == 20 else f"b{beam}"
-    return f"{m_str}-{o_str}-{beam_str}"
+    label = f"{m_str}-{o_str}-{beam_str}"
+    if not beam_climbing:
+        label += "-no_bc"
+    if sparsify_errors:
+        label += "-sp"
+        if sparsify_reactivate_limit != -1:
+            label += f"({sparsify_reactivate_limit})"
+    else:
+        label += "-nosp"
+    return label
 
 def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, title):
     plt.figure(figsize=(12, 9))
@@ -169,7 +185,12 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
                     lw = 1.5
 
                 # Fastest
-                lbl_fast = format_gari_label(fastest_gari['mode'], fastest_gari['order'], b_val)
+                lbl_fast = format_gari_label(
+                    fastest_gari['mode'], fastest_gari['order'], b_val,
+                    fastest_gari.get('beam_climbing', True),
+                    fastest_gari.get('sparsify_errors', False),
+                    fastest_gari.get('sparsify_reactivate_limit', -1)
+                )
                 plt.scatter(fastest_gari['time_per_round'], fastest_gari['ler'], facecolor=fc, edgecolor=ec, 
                             marker='<', s=180, linewidths=lw, zorder=4)
                 plt.errorbar(fastest_gari['time_per_round'], fastest_gari['ler'], yerr=[[fastest_gari['ler_err_low']], [fastest_gari['ler_err_high']]], 
@@ -179,7 +200,12 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
 
                 # Most Accurate
                 if fastest_gari != most_acc_gari:
-                    lbl_acc = format_gari_label(most_acc_gari['mode'], most_acc_gari['order'], b_val)
+                    lbl_acc = format_gari_label(
+                        most_acc_gari['mode'], most_acc_gari['order'], b_val,
+                        most_acc_gari.get('beam_climbing', True),
+                        most_acc_gari.get('sparsify_errors', False),
+                        most_acc_gari.get('sparsify_reactivate_limit', -1)
+                    )
                     plt.scatter(most_acc_gari['time_per_round'], most_acc_gari['ler'], facecolor=fc, edgecolor=ec, 
                                 marker='v', s=180, linewidths=lw, zorder=4)
                     plt.errorbar(most_acc_gari['time_per_round'], most_acc_gari['ler'], yerr=[[most_acc_gari['ler_err_low']], [most_acc_gari['ler_err_high']]], 
