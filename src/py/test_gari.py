@@ -46,8 +46,8 @@ def test_gari_transform():
         circuit = stim.Circuit.from_file(sys.argv[1])
     else:
         circuit = load_circuit("surfacecodes", d=5, r=5, p=0.001, obs_basis='Z')
-        # circuit = load_circuit("bivariatebicyclecodes", d=12, r=12, p=0.002, obs_basis='Z')
-        # circuit = load_circuit("colorcodes", d=11, r=11, p=0.001, obs_basis='Z')
+        # circuit = load_circuit("bivariatebicyclecodes", d=10, r=10, p=0.001, obs_basis='Z')
+        # circuit = load_circuit("colorcodes", d=7, r=7, p=0.001, obs_basis='Z')
 
     dem = circuit.detector_error_model()
     print("Extracting DEM...")
@@ -69,6 +69,7 @@ def test_gari_transform():
     
     print("Building original Check Matrix...")
     H, L, priors, errors = dem_to_check_matrices(dem)
+    # H, L, priors, errors = dem_to_check_matrices(dem2)
     print(f"Original Check Matrix Shape: {H.shape}")
     print(f"Original Observables Matrix Shape: {L.shape}")
     
@@ -83,9 +84,10 @@ def test_gari_transform():
     gari_matrix, gari_obs_matrix = res[0], res[1]
     p_agg, p_keep_free, p_keep_scaled, p_hf, p_tiny = res[2], res[3], res[4], res[5], res[6]
     p_hf_agg, p_tiny_agg, p_keep_keep, p_keep_max = res[7], res[8], res[9], res[10]
-    p_hf_max, p_tiny_max, p_keep_freeY_agg, p_keep_freeY_max, p_keep_xor, p_scaled_xor = res[11], res[12], res[13], res[14], res[15], res[16]
-    dx, dz, nx_virt, nz_virt, time_vx, time_vz = res[17], res[18], res[19], res[20], res[21], res[22]
-    gari_obs_matrix_og = res[23]
+    p_hf_max, p_tiny_max, p_keep_freeY_agg, p_keep_freeY_max, p_keep_xor, p_scaled_xor, p_mode_P, p_mode_Q, p_mode_R, p_mode_S = res[11], res[12], res[13], res[14], res[15], res[16], res[17], res[18], res[19], res[20]
+    p_mode_U, p_mode_V, p_mode_S2, p_mode_SO, p_mode_SO2 = res[34], res[35], res[36], res[37], res[38]
+    dx, dz, nx_virt, nz_virt, time_vx, time_vz = res[21], res[22], res[23], res[24], res[25], res[26]
+    gari_obs_matrix_og = res[27]
     
     dem_agg = matrices_to_dem(gari_matrix, gari_obs_matrix, p_agg)
     dem_keep_free = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_free)
@@ -102,6 +104,15 @@ def test_gari_transform():
     dem_keep_freeY_max = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_freeY_max)
     dem_hf_xor = matrices_to_dem(gari_matrix, gari_obs_matrix, p_keep_xor)
     dem_scaled_xor = matrices_to_dem(gari_matrix, gari_obs_matrix, p_scaled_xor)
+    dem_mode_P = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_P)
+    dem_mode_Q = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_Q)
+    dem_mode_R = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_R)
+    dem_mode_S = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_S)
+    dem_mode_U = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_U)
+    dem_mode_V = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_V)
+    dem_mode_S2 = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_S2)
+    dem_mode_SO = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_SO)
+    dem_mode_SO2 = matrices_to_dem(gari_matrix, gari_obs_matrix, p_mode_SO2)
     
     print(f"Gari Matrix Shape: {gari_matrix.shape}")
     print(f"Gari DEM has {dem_agg.num_detectors} detectors and {dem_agg.num_errors} errors.")
@@ -122,7 +133,7 @@ def test_gari_transform():
     if has_tesseract:
         print("\n--- Running Tesseract Decoder Comparison ---")
 
-        num_shots = 100000
+        num_shots = 1000
         sampler = circuit.compile_detector_sampler(seed=0)
         shots, obs_shots = sampler.sample(shots=num_shots, separate_observables=True)
         
@@ -149,7 +160,7 @@ def test_gari_transform():
         
         # We will test native orderings after gari_shots is defined!
         
-        orders = get_gari_orderings(dem, dem_agg, res[17], res[18], det_types, res[19], res[21], res[22], res[24], res[25], res[26], res[27], res[28], res[29])
+        orders = get_gari_orderings(dem, dem_agg, res[21], res[22], det_types, res[23], res[25], res[26], res[28], res[29], res[30], res[31], res[32], res[33])
         
         # Pad and align shots for Gari DEM
         is_x_det = (det_types == 1)
@@ -161,7 +172,7 @@ def test_gari_transform():
         gari_shots = np.concatenate([x_shots, z_shots, virtual_shots], axis=1)
         
         prior_modes = {
-            "Mode A: Aggregated (Original Double-Count)": dem_agg,
+            # "Mode A: Aggregated (Original Double-Count)": dem_agg,
             # "Mode B: ez,ex,ey Keep, ez',ex' Free (0.499)": dem_keep_free,
             # "Mode C: ez,ex,ey Keep, ez',ex' Scaled (0.05x)": dem_keep_scaled,
             # "Mode D: ez,ex,ey Free (0.499), ez',ex' Penalized": dem_hf,
@@ -169,11 +180,20 @@ def test_gari_transform():
             # "Mode F: ez,ex,ey Free (0.499), ez',ex' Aggregated": dem_hf_agg,
             # "Mode G: ez,ex,ey Scaled (0.05x), ez',ex' Aggregated": dem_tiny_agg,
             # "Mode H: ez,ex,ey Keep, ez',ex' Keep": dem_keep_keep,
-            "Mode I: ez,ex,ey Keep, ez',ex' Maxed": dem_keep_max,
+            # "Mode I: ez,ex,ey Keep, ez',ex' Maxed": dem_keep_max,
             # "Mode J: ez,ex,ey Free, ez',ex' Maxed": dem_hf_max,
             # "Mode K: ez,ex,ey Scaled, ez',ex' Maxed": dem_tiny_max
             "Mode N: ez,ex,ey Keep, ez',ex' XOR Aggregated": dem_hf_xor,
-            "Mode O: ez,ex,ey Scaled, ez',ex' XOR Aggregated": dem_scaled_xor
+            # "Mode O: ez,ex,ey Scaled, ez',ex' XOR Aggregated": dem_scaled_xor,
+            "Mode P: LP based Weight Distribution (Fixed Epsilon)": dem_mode_P,
+            "Mode Q: LP based Weight Distribution (No Lambda)": dem_mode_Q,
+            "Mode R: LP based Weight Distribution (Uniform Lambda)": dem_mode_R,
+            "Mode S: LP based Weight Distribution (Weighted Lambda)": dem_mode_S,
+            "Mode U: Max-Min Formulation (Zero-Cost Reals allowed, Lambda = 1)": dem_mode_U,
+            "Mode V: Max-Min Formulation (Zero-Cost Reals allowed, Topologically Weighted Lambda)": dem_mode_V,
+            "Mode S2: Max-Min Formulation (g_real >= t, Topologically Weighted Lambda)": dem_mode_S2,
+            "Mode SO: Max-Min Formulation (g_real >= t, Original Weighted Lambda, Safe Lambda Reg)": dem_mode_SO,
+            "Mode SO2: Max-Min Formulation (g_real >= t, Topologically Weighted Lambda, Safe Lambda Reg)": dem_mode_SO2
         }
         
         print("\nTesting Priority Modes on Gari DEM ...")

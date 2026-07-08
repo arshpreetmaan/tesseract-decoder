@@ -355,16 +355,295 @@ def gari_transform(H: csc_matrix, L: csc_matrix, det_types: np.ndarray, priors: 
         P_ez_prime_xor, P_ex_prime_xor
     ])
     
+    # --- LP Setup ---
+    from scipy.sparse import bmat, eye as speye, vstack, hstack
+    from scipy.optimize import linprog
+    
+    P_real_orig = np.concatenate([P_dx, P_dz, P_y])
+    b_ub = cost(P_real_orig)
+    
+    N_real = len(b_ub)
+    N_virtual = nx + nz
+    
+    I_nx = speye(nx, format='csc')
+    I_nz = speye(nz, format='csc')
+    
+    # Original A_ub mapping virtuals to reals
+    A_ub_orig = bmat([
+        [I_nx, None],
+        [None, I_nz],
+        [U.T,  V.T]
+    ], format='csc')
+    
+    # We add a variable 't' at the end of the variable vector: x = [g_virt, t]
+    # Constraint 1: g_real >= t  =>  A_ub_orig * g_virt + t <= b_ub
+    col_ones_real = np.ones((N_real, 1))
+    A_upper = hstack([A_ub_orig, col_ones_real], format='csc')
+    
+    # Constraint 2: g_virt >= t  =>  -I * g_virt + t <= 0
+    I_virt = speye(N_virtual, format='csc')
+    col_ones_virt = np.ones((N_virtual, 1))
+    A_lower = hstack([-I_virt, col_ones_virt], format='csc')
+    
+    # Combine all constraints
+    A_ub_new = vstack([A_upper, A_lower], format='csc')
+    b_ub_new = np.concatenate([b_ub, np.zeros(N_virtual)])
+    bounds = [(0, None)] * (N_virtual + 1)
+    lambda_reg = 1e-4
+
+    # --- Mode Q: Linear Programming based weight distribution (No Lambda) ---
+    c_obj_Q = np.zeros(N_virtual + 1)
+    c_obj_Q[-1] = -1.0
+    
+    print("Solving LP (Max-Min Formulation)...")
+    res_lp_Q = linprog(c_obj_Q, A_ub=A_ub_new, b_ub=b_ub_new, bounds=bounds, method='highs')
+    
+    if res_lp_Q.success:
+        x_res_Q = res_lp_Q.x
+        g_virt_Q = x_res_Q[:-1]
+        t_val_Q = x_res_Q[-1]
+        
+        print(f"LP Solver Finished. Minimum edge floor (t): {t_val_Q:.4f}")
+        
+        g_real_Q = b_ub - A_ub_orig.dot(g_virt_Q)
+        
+        P_real_Q = prob(g_real_Q)
+        P_virt_Q = prob(g_virt_Q)
+        
+        gari_priors_mode_Q = np.concatenate([P_real_Q, P_virt_Q])
+    else:
+        print(f"LP Solver failed: {res_lp_Q.message}")
+        raise NotImplementedError
+
+    # --- Mode P: Fixed Epsilon LP ---
+    c_obj_P = np.zeros(N_real + N_virtual)
+    c_obj_P[-N_virtual:] = -1.0
+    
+    A_eq_P = hstack([speye(N_real, format='csc'), A_ub_orig], format='csc')
+    b_eq_P = b_ub
+    
+    w_z, w_x, w_y = C_z, C_x, C_y
+    min_w_vals = [np.min(w) for w in (w_z, w_x, w_y) if len(w) > 0]
+    min_w = min(min_w_vals) if min_w_vals else 1e-10
+    dynamic_eps = min_w / 1e5
+    
+    bounds_P = [(dynamic_eps, None)] * (N_real + N_virtual)
+    
+    print("Solving LP (Mode P: Fixed Epsilon)...")
+    res_lp_P = linprog(c_obj_P, A_eq=A_eq_P, b_eq=b_eq_P, bounds=bounds_P, method='highs')
+    
+    if res_lp_P.success:
+        x_res_P = res_lp_P.x
+        g_real_P = x_res_P[:N_real]
+        g_virt_P = x_res_P[N_real:]
+        
+        P_real_P = prob(g_real_P)
+        P_virt_P = prob(g_virt_P)
+        
+        gari_priors_mode_P = np.concatenate([P_real_P, P_virt_P])
+        print("LP Solver Mode P Finished.")
+    else:
+        print(f"Warning: LP Solver Mode P failed: {res_lp_P.message}")
+        # Return original weights (aggregated) so decoder doesn't crash
+        gari_priors_mode_P = gari_priors_agg.copy()
+
+
+    # --- Mode R: Linear Programming based weight distribution (Uniform Lambda) ---
+    c_obj_R = -lambda_reg * np.ones(N_virtual + 1)
+    c_obj_R[-1] = -1.0
+    
+    print("Solving LP (Max-Min Formulation with Uniform Lambda)...")
+    res_lp_R = linprog(c_obj_R, A_ub=A_ub_new, b_ub=b_ub_new, bounds=bounds, method='highs')
+    
+    if res_lp_R.success:
+        x_res_R = res_lp_R.x
+        g_virt_R = x_res_R[:-1]
+        t_val_R = x_res_R[-1]
+        
+        print(f"LP Solver Finished. Minimum edge floor (t): {t_val_R:.4f}")
+        
+        g_real_R = b_ub - A_ub_orig.dot(g_virt_R)
+        
+        P_real_R = prob(g_real_R)
+        P_virt_R = prob(g_virt_R)
+        
+        gari_priors_mode_R = np.concatenate([P_real_R, P_virt_R])
+    else:
+        print(f"LP Solver failed: {res_lp_R.message}")
+        raise NotImplementedError
+
+    # --- Mode S: Linear Programming based weight distribution (Weighted Lambda) ---
+    weights_virtual = b_ub[:N_virtual]
+    lambda_array = lambda_reg * (weights_virtual / np.max(weights_virtual))
+    c_obj_S = np.zeros(N_virtual + 1)
+    c_obj_S[:-1] = -lambda_array
+    c_obj_S[-1] = -1.0
+    
+    print("Solving LP (Max-Min Formulation with Weighted Lambda)...")
+    res_lp_S = linprog(c_obj_S, A_ub=A_ub_new, b_ub=b_ub_new, bounds=bounds, method='highs')
+    
+    if res_lp_S.success:
+        x_res_S = res_lp_S.x
+        g_virt_S = x_res_S[:-1]
+        t_val_S = x_res_S[-1]
+        
+        print(f"LP Solver Finished. Minimum edge floor (t): {t_val_S:.4f}")
+        
+        g_real_S = b_ub - A_ub_orig.dot(g_virt_S)
+        
+        P_real_S = prob(g_real_S)
+        P_virt_S = prob(g_virt_S)
+        
+        gari_priors_mode_S = np.concatenate([P_real_S, P_virt_S])
+    else:
+        print(f"LP Solver failed: {res_lp_S.message}")
+        raise NotImplementedError
+
+
+    # --- Mode S2: Max-Min Formulation (g_real >= t, Topologically Weighted Lambda) ---
+    W_z = b_ub[:nx]
+    W_x = b_ub[nx:N_virtual]
+    W_y = b_ub[N_virtual:]
+    
+    S_z = W_z + U.dot(W_y)
+    S_x = W_x + V.dot(W_y)
+    S_virt = np.concatenate([S_z, S_x])
+    lambda_array_S2 = lambda_reg * (S_virt / np.max(S_virt))
+    
+    c_obj_S2 = np.zeros(N_virtual + 1)
+    c_obj_S2[:-1] = -lambda_array_S2
+    c_obj_S2[-1] = -1.0
+    
+    print("Solving LP (Mode S2: Max-Min Formulation, Topologically Weighted Lambda)...")
+    res_lp_S2 = linprog(c_obj_S2, A_ub=A_ub_new, b_ub=b_ub_new, bounds=bounds, method='highs')
+    
+    if res_lp_S2.success:
+        x_res_S2 = res_lp_S2.x
+        g_virt_S2 = x_res_S2[:-1]
+        g_real_S2 = b_ub - A_ub_orig.dot(g_virt_S2)
+        gari_priors_mode_S2 = np.concatenate([prob(g_real_S2), prob(g_virt_S2)])
+    else:
+        print(f"LP Solver failed for Mode S2: {res_lp_S2.message}")
+        raise NotImplementedError
+
+
+    # --- Mode SO: Max-Min Formulation (g_real >= t, Original Weighted Lambda, Dynamic Safe Lambda Reg) ---
+    weights_virtual = b_ub[:N_virtual]
+    normalized_W = weights_virtual / np.max(weights_virtual)
+    safe_lambda_reg_SO = 0.99 / np.sum(normalized_W)
+    lambda_array_SO = safe_lambda_reg_SO * normalized_W
+    
+    c_obj_SO = np.zeros(N_virtual + 1)
+    c_obj_SO[:-1] = -lambda_array_SO
+    c_obj_SO[-1] = -1.0
+    
+    print("Solving LP (Mode SO: Max-Min Formulation, Original Weighted Lambda, Safe Lambda Reg)...")
+    res_lp_SO = linprog(c_obj_SO, A_ub=A_ub_new, b_ub=b_ub_new, bounds=bounds, method='highs')
+    
+    if res_lp_SO.success:
+        x_res_SO = res_lp_SO.x
+        g_virt_SO = x_res_SO[:-1]
+        g_real_SO = b_ub - A_ub_orig.dot(g_virt_SO)
+        gari_priors_mode_SO = np.concatenate([prob(g_real_SO), prob(g_virt_SO)])
+    else:
+        print(f"LP Solver failed for Mode SO: {res_lp_SO.message}")
+        raise NotImplementedError
+
+    # --- Mode SO2: Max-Min Formulation (g_real >= t, Topologically Weighted Lambda, Dynamic Safe Lambda Reg) ---
+    W_z = b_ub[:nx]
+    W_x = b_ub[nx:N_virtual]
+    W_y = b_ub[N_virtual:]
+    
+    S_z_o = W_z + U.dot(W_y)
+    S_x_o = W_x + V.dot(W_y)
+    S_virt_o = np.concatenate([S_z_o, S_x_o])
+    
+    normalized_S = S_virt_o / np.max(S_virt_o)
+    safe_lambda_reg_SO2 = 0.99 / np.sum(normalized_S)
+    lambda_array_SO2 = safe_lambda_reg_SO2 * normalized_S
+    
+    c_obj_SO2 = np.zeros(N_virtual + 1)
+    c_obj_SO2[:-1] = -lambda_array_SO2
+    c_obj_SO2[-1] = -1.0
+    
+    print("Solving LP (Mode SO2: Max-Min Formulation, Topologically Weighted Lambda, Safe Lambda Reg)...")
+    res_lp_SO2 = linprog(c_obj_SO2, A_ub=A_ub_new, b_ub=b_ub_new, bounds=bounds, method='highs')
+    
+    if res_lp_SO2.success:
+        x_res_SO2 = res_lp_SO2.x
+        g_virt_SO2 = x_res_SO2[:-1]
+        g_real_SO2 = b_ub - A_ub_orig.dot(g_virt_SO2)
+        gari_priors_mode_SO2 = np.concatenate([prob(g_real_SO2), prob(g_virt_SO2)])
+    else:
+        print(f"LP Solver failed for Mode SO2: {res_lp_SO2.message}")
+        raise NotImplementedError
+
+    # --- Mode U: Max-Min Formulation (Zero-Cost Reals allowed, Lambda = 1) ---
+    # We remove the g_real >= t constraint. We only enforce g_virt >= t (A_lower).
+    # Upper bound is just A_ub_orig * g_virt <= b_ub
+    A_upper_UV = hstack([A_ub_orig, np.zeros((N_real, 1))], format='csc')
+    A_ub_UV = vstack([A_upper_UV, A_lower], format='csc')
+    
+    # Enforce safety epsilon for A* (preventing exactly 0-cost edges)
+    # 1. Virtual edges are >= t, so we bound t >= dynamic_eps
+    bounds_UV = [(0, None)] * N_virtual + [(dynamic_eps, None)]
+    # 2. Real edges are g_real = b_ub - A_ub_orig*g_virt >= eps => A_ub_orig*g_virt <= b_ub - eps
+    b_ub_UV = np.concatenate([b_ub - dynamic_eps, np.zeros(N_virtual)])
+    
+    c_obj_U = np.zeros(N_virtual + 1)
+    c_obj_U[:-1] = -1.0  # lambda = 1.0 for all virtual edges
+    c_obj_U[-1] = -1.0
+    
+    print("Solving LP (Mode U: Zero-Cost Reals, Lambda = 1, Safety Eps)...")
+    res_lp_U = linprog(c_obj_U, A_ub=A_ub_UV, b_ub=b_ub_UV, bounds=bounds_UV, method='highs')
+    
+    if res_lp_U.success:
+        g_virt_U = res_lp_U.x[:-1]
+        g_real_U = b_ub - A_ub_orig.dot(g_virt_U)
+        gari_priors_mode_U = np.concatenate([prob(g_real_U), prob(g_virt_U)])
+    else:
+        print(f"LP Solver failed for Mode U: {res_lp_U.message}")
+        raise NotImplementedError
+
+    # --- Mode V: Max-Min Formulation (Zero-Cost Reals allowed, Topologically Weighted Lambda) ---
+    W_z = b_ub[:nx]
+    W_x = b_ub[nx:N_virtual]
+    W_y = b_ub[N_virtual:]
+    
+    S_z = W_z + U.dot(W_y)
+    S_x = W_x + V.dot(W_y)
+    
+    S_virt = np.concatenate([S_z, S_x])
+    lambda_array_V = lambda_reg * (S_virt / np.max(S_virt))
+    
+    c_obj_V = np.zeros(N_virtual + 1)
+    c_obj_V[:-1] = -lambda_array_V
+    c_obj_V[-1] = -1.0
+    
+    print("Solving LP (Mode V: Zero-Cost Reals, Topologically Weighted Lambda, Safety Eps)...")
+    res_lp_V = linprog(c_obj_V, A_ub=A_ub_UV, b_ub=b_ub_UV, bounds=bounds_UV, method='highs')
+    
+    if res_lp_V.success:
+        g_virt_V = res_lp_V.x[:-1]
+        g_real_V = b_ub - A_ub_orig.dot(g_virt_V)
+        gari_priors_mode_V = np.concatenate([prob(g_real_V), prob(g_virt_V)])
+    else:
+        print(f"LP Solver failed for Mode V: {res_lp_V.message}")
+        raise NotImplementedError
+    
+    x_orig_indices = np.where(det_types == 1)[0]
+    z_orig_indices = np.where(det_types == 3)[0]
+
     time_vy = [max(
-        np.max(hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else 0,
-        np.max(hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else 0
+        np.max([x_orig_indices[r] for r in hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else 0,
+        np.max([z_orig_indices[r] for r in hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else 0
     ) for c in i_hy]
     
     U_csr = U.tocsr()
     V_csr = V.tocsr()
     
-    time_vx_old = [np.max(hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else 0 for c in i_hx_only]
-    time_vz_old = [np.max(hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else 0 for c in i_hz_only]
+    time_vx_old = [np.max([x_orig_indices[r] for r in hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else 0 for c in i_hx_only]
+    time_vz_old = [np.max([z_orig_indices[r] for r in hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else 0 for c in i_hz_only]
 
     time_vx_new = [max(
         time_vx_old[i],
@@ -376,13 +655,13 @@ def gari_transform(H: csc_matrix, L: csc_matrix, det_types: np.ndarray, priors: 
         max([time_vy[k] for k in V_csr.indices[V_csr.indptr[i]:V_csr.indptr[i+1]]]) if V_csr.indptr[i+1] > V_csr.indptr[i] else 0
     ) for i, c in enumerate(i_hz_only)]
     
-    time_vx_min_old = [np.min(hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else 0 for c in i_hx_only]
-    time_vz_min_old = [np.min(hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else 0 for c in i_hz_only]
+    time_vx_min_old = [np.min([x_orig_indices[r] for r in hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else 0 for c in i_hx_only]
+    time_vz_min_old = [np.min([z_orig_indices[r] for r in hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else 0 for c in i_hz_only]
     
     time_vy_min = []
     for c in i_hy:
-        t_hx = np.min(hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else float('inf')
-        t_hz = np.min(hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else float('inf')
+        t_hx = np.min([x_orig_indices[r] for r in hx_csc.indices[hx_csc.indptr[c]:hx_csc.indptr[c+1]]]) if hx_csc.indptr[c+1] > hx_csc.indptr[c] else float('inf')
+        t_hz = np.min([z_orig_indices[r] for r in hz_csc.indices[hz_csc.indptr[c]:hz_csc.indptr[c+1]]]) if hz_csc.indptr[c+1] > hz_csc.indptr[c] else float('inf')
         t_min = min(t_hx, t_hz)
         time_vy_min.append(t_min if t_min != float('inf') else 0)
         
@@ -402,7 +681,7 @@ def gari_transform(H: csc_matrix, L: csc_matrix, det_types: np.ndarray, priors: 
     
     if return_dem:
         return matrices_to_dem(gari_matrix, gari_obs_matrix, gari_priors_agg), nx, nz, time_vx_old, time_vz_old, gari_obs_matrix_og, time_vx_new, time_vz_new, time_vx_min_old, time_vz_min_old, time_vx_min_new, time_vz_min_new
-    return gari_matrix, gari_obs_matrix, gari_priors_agg, gari_priors_keep_free, gari_priors_keep_scaled, gari_priors_hidden_free, gari_priors_tiny, gari_priors_hf_agg, gari_priors_tiny_agg, gari_priors_keep_keep, gari_priors_keep_max, gari_priors_hf_max, gari_priors_tiny_max, gari_priors_keep_freeY_agg, gari_priors_keep_freeY_max, gari_priors_keep_xor, gari_priors_scaled_xor, dx, dz, nx, nz, time_vx_old, time_vz_old, gari_obs_matrix_og, time_vx_new, time_vz_new, time_vx_min_old, time_vz_min_old, time_vx_min_new, time_vz_min_new
+    return gari_matrix, gari_obs_matrix, gari_priors_agg, gari_priors_keep_free, gari_priors_keep_scaled, gari_priors_hidden_free, gari_priors_tiny, gari_priors_hf_agg, gari_priors_tiny_agg, gari_priors_keep_keep, gari_priors_keep_max, gari_priors_hf_max, gari_priors_tiny_max, gari_priors_keep_freeY_agg, gari_priors_keep_freeY_max, gari_priors_keep_xor, gari_priors_scaled_xor, gari_priors_mode_P, gari_priors_mode_Q, gari_priors_mode_R, gari_priors_mode_S, dx, dz, nx, nz, time_vx_old, time_vz_old, gari_obs_matrix_og, time_vx_new, time_vz_new, time_vx_min_old, time_vz_min_old, time_vx_min_new, time_vz_min_new, gari_priors_mode_U, gari_priors_mode_V, gari_priors_mode_S2, gari_priors_mode_SO, gari_priors_mode_SO2
 
 def get_gari_orderings(dem, gari_dem, dx, dz, det_types, nx_virt, time_vx_old, time_vz_old, time_vx_new, time_vz_new, time_vx_min_old, time_vz_min_old, time_vx_min_new, time_vz_min_new):
     """
@@ -419,63 +698,8 @@ def get_gari_orderings(dem, gari_dem, dx, dz, det_types, nx_virt, time_vx_old, t
     x_orig_indices = np.where(det_types == 1)[0]
     z_orig_indices = np.where(det_types == 3)[0]
 
-    # Option 5: First-Touch Interleaved (Chronological)
-    virtuals_to_insert_first = {i: [] for i in range(dem.num_detectors)}
-    for c in range(dx.shape[1]):
-        start = dx.indptr[c]
-        end = dx.indptr[c+1]
-        if start < end:
-            min_orig_idx = min([x_orig_indices[r] for r in dx.indices[start:end]])
-            virtuals_to_insert_first[min_orig_idx].append(nx_real + nz_real + c)
-        else:
-            virtuals_to_insert_first[0].append(nx_real + nz_real + c)
-    for c in range(dz.shape[1]):
-        start = dz.indptr[c]
-        end = dz.indptr[c+1]
-        if start < end:
-            min_orig_idx = min([z_orig_indices[r] for r in dz.indices[start:end]])
-            virtuals_to_insert_first[min_orig_idx].append(nx_real + nz_real + nx_virt + c)
-        else:
-            virtuals_to_insert_first[0].append(nx_real + nz_real + nx_virt + c)
-            
-    order_5 = []
-    for orig_idx in range(dem.num_detectors):
-        if orig_idx in x_orig_indices:
-            gari_idx = np.where(x_orig_indices == orig_idx)[0][0]
-            order_5.append(int(gari_idx))
-        elif orig_idx in z_orig_indices:
-            gari_idx = np.where(z_orig_indices == orig_idx)[0][0]
-            order_5.append(int(nx_real + gari_idx))
-        order_5.extend(virtuals_to_insert_first[orig_idx])
-
-    # Option 6: Last-Touch Interleaved (Chronological)
-    virtuals_to_insert_last = {i: [] for i in range(dem.num_detectors)}
-    for c in range(dx.shape[1]):
-        start = dx.indptr[c]
-        end = dx.indptr[c+1]
-        if start < end:
-            max_orig_idx = max([x_orig_indices[r] for r in dx.indices[start:end]])
-            virtuals_to_insert_last[max_orig_idx].append(nx_real + nz_real + c)
-        else:
-            virtuals_to_insert_last[dem.num_detectors-1].append(nx_real + nz_real + c)
-    for c in range(dz.shape[1]):
-        start = dz.indptr[c]
-        end = dz.indptr[c+1]
-        if start < end:
-            max_orig_idx = max([z_orig_indices[r] for r in dz.indices[start:end]])
-            virtuals_to_insert_last[max_orig_idx].append(nx_real + nz_real + nx_virt + c)
-        else:
-            virtuals_to_insert_last[dem.num_detectors-1].append(nx_real + nz_real + nx_virt + c)
-            
-    order_6 = []
-    for orig_idx in range(dem.num_detectors):
-        if orig_idx in x_orig_indices:
-            gari_idx = np.where(x_orig_indices == orig_idx)[0][0]
-            order_6.append(int(gari_idx))
-        elif orig_idx in z_orig_indices:
-            gari_idx = np.where(z_orig_indices == orig_idx)[0][0]
-            order_6.append(int(nx_real + gari_idx))
-        order_6.extend(virtuals_to_insert_last[orig_idx])
+    x_map = {orig_idx: int(gari_idx) for gari_idx, orig_idx in enumerate(x_orig_indices)}
+    z_map = {orig_idx: int(nx_real + gari_idx) for gari_idx, orig_idx in enumerate(z_orig_indices)}
 
     # Standard Block Combinations
     order_1 = real_x_gari + virt_x_gari + real_z_gari + virt_z_gari
@@ -489,12 +713,10 @@ def get_gari_orderings(dem, gari_dem, dx, dz, det_types, nx_virt, time_vx_old, t
     # Option 7: Chronological Real, Chronological Virtual
     real_gari_chronological = []
     for orig_idx in range(dem.num_detectors):
-        if orig_idx in x_orig_indices:
-            gari_idx = np.where(x_orig_indices == orig_idx)[0][0]
-            real_gari_chronological.append(int(gari_idx))
-        elif orig_idx in z_orig_indices:
-            gari_idx = np.where(z_orig_indices == orig_idx)[0][0]
-            real_gari_chronological.append(int(nx_real + gari_idx))
+        if orig_idx in x_map:
+            real_gari_chronological.append(x_map[orig_idx])
+        elif orig_idx in z_map:
+            real_gari_chronological.append(z_map[orig_idx])
             
     virt_with_time_old = []
     for c in range(nx_virt):
@@ -539,19 +761,66 @@ def get_gari_orderings(dem, gari_dem, dx, dz, det_types, nx_virt, time_vx_old, t
     virt_with_time_min_new.sort(key=lambda x: x[0])
     order_7c = real_gari_chronological + [v[1] for v in virt_with_time_min_new]
 
+    # Helper for Order 11 (Safe-Interleaved) Variants
+    def get_order_11_variant(v_x_times, v_z_times):
+        all_det = []
+        for orig_idx in range(dem.num_detectors):
+            if orig_idx in x_map:
+                all_det.append((orig_idx, x_map[orig_idx]))
+            elif orig_idx in z_map:
+                all_det.append((orig_idx, z_map[orig_idx]))
+        
+        for c in range(nx_virt):
+            all_det.append((v_x_times[c] + 0.1, nx_real + nz_real + c))
+        for c in range(len(v_z_times)):
+            all_det.append((v_z_times[c] + 0.1, nx_real + nz_real + nx_virt + c))
+            
+        all_det.sort(key=lambda x: x[0])
+        return [v[1] for v in all_det]
+
+    order_11 = get_order_11_variant(time_vx_new, time_vz_new)       # Safe-Interleaved (includes Y) - Best
+    order_11a = get_order_11_variant(time_vx_old, time_vz_old)      # Last-Touch Interleaved (ignores Y)
+    order_11b = get_order_11_variant(time_vx_min_new, time_vz_min_new) # First-Touch Interleaved (includes Y)
+
+    # Helper for Order 12 (Reverse Safe-Interleaved) Variants
+    def get_order_12_variant(v_x_times, v_z_times):
+        all_det = []
+        for orig_idx in range(dem.num_detectors):
+            if orig_idx in x_map:
+                all_det.append((orig_idx, x_map[orig_idx]))
+            elif orig_idx in z_map:
+                all_det.append((orig_idx, z_map[orig_idx]))
+        
+        for c in range(nx_virt):
+            all_det.append((v_x_times[c] - 0.1, nx_real + nz_real + c))
+        for c in range(len(v_z_times)):
+            all_det.append((v_z_times[c] - 0.1, nx_real + nz_real + nx_virt + c))
+            
+        all_det.sort(key=lambda x: x[0], reverse=True)
+        return [v[1] for v in all_det]
+
+    order_12 = get_order_12_variant(time_vx_min_new, time_vz_min_new)       # Safe-Reverse (includes Y) - Best for reverse
+    order_12a = get_order_12_variant(time_vx_min_old, time_vz_min_old)      # Last-Touch Reverse (ignores Y)
+    order_12b = get_order_12_variant(time_vx_new, time_vz_new)              # First-Touch Reverse (includes Y)
+
     return {
         # "order1": order_1, # Option 1 (RealX, VirtX, RealZ, VirtZ)
         "order2": order_2, # Option 2 (RealX, RealZ, VirtX, VirtZ)
         "order4": order_4, # Option 4 (RealX, RealZ, VirtZ, VirtX)
-        #"order5": order_5, # Option 5 (First-Touch Interleaved Chrono) - EXTREMELY SLOW
-        #"order6": order_6, # Option 6 (Last-Touch Interleaved Chrono) - EXTREMELY SLOW
         "order7": order_7, # Option 7 (Chrono Real, Chrono Virt without ey)
-        "order7a": order_7a, # Option 7a (Chrono Real, Chrono Virt with ey max)
-        "order7b": order_7b, # Option 7b (Chrono Real, Chrono Virt min without ey)
-        "order7c": order_7c, # Option 7c (Chrono Real, Chrono Virt min with ey)
+        # "order7a": order_7a, # Option 7a (Chrono Real, Chrono Virt with ey max)
+        # "order7b": order_7b, # Option 7b (Chrono Real, Chrono Virt min without ey)
+        # "order7c": order_7c, # Option 7c (Chrono Real, Chrono Virt min with ey)
         "order9": order_9, # Option 9 (RealZ, RealX, VirtZ, VirtX)
-        "order10": order_10 # Option 10 (RealZ, RealX, VirtX, VirtZ)
+        "order10": order_10, # Option 10 (RealZ, RealX, VirtX, VirtZ)
+        # "order11": order_11, # Option 11 (Safe-Interleaved Chrono with ey) - BEST FORWARD
+        # "order11a": order_11a, # Option 11a (Last-Touch Interleaved Chrono without ey)
+        # "order11b": order_11b, # Option 11b (First-Touch Interleaved Chrono with ey)
+        # "order12": order_12, # Option 12 (Safe-Reverse Interleaved with ey) - BEST REVERSE
+        # "order12a": order_12a, # Option 12a (Last-Touch Reverse Interleaved without ey)
+        # "order12b": order_12b # Option 12b (First-Touch Reverse Interleaved with ey)
     }
+
 
 def process_directory(input_path):
     """
@@ -589,7 +858,7 @@ def process_directory(input_path):
             
             gari_matrix = res[0]
             gari_obs_matrix = res[1]
-            gari_obs_matrix_og = res[23]
+            gari_obs_matrix_og = res[27]
             
             stim_dir = os.path.dirname(stim_path)
             stim_stem = os.path.splitext(os.path.basename(stim_path))[0]
@@ -610,7 +879,16 @@ def process_directory(input_path):
                 "modeL": 13,
                 "modeM": 14,
                 "modeN": 15,
-                "modeO": 16
+                "modeO": 16,
+                "modeP": 17,
+                "modeQ": 18,
+                "modeR": 19,
+                "modeS": 20,
+                "modeU": 34,
+                "modeV": 35,
+                "modeS2": 36,
+                "modeSO": 37,
+                "modeSO2": 38
             }
             
             for mode_name, index in modes_to_generate.items():
@@ -635,7 +913,7 @@ def process_directory(input_path):
                 mapping[int(orig_idx)] = int(nx + gari_idx)
                 
             dummy_dem = matrices_to_dem(res[0], res[1], res[2])
-            orderings = get_gari_orderings(dem, dummy_dem, res[17], res[18], det_types, res[19], res[21], res[22], res[24], res[25], res[26], res[27], res[28], res[29])
+            orderings = get_gari_orderings(dem, dummy_dem, res[21], res[22], det_types, res[23], res[25], res[26], res[28], res[29], res[30], res[31], res[32], res[33])
             
             det_orders_clean = {}
             for k, v in orderings.items():
