@@ -14,14 +14,20 @@ def generate_interactive_plot():
     # compute tradeoff data for all points
     baselines = {}
     for m in metrics:
-        if m['is_baseline'] and m['num_det_orders'] > 1:
+        if m['is_baseline']:
             key = (m['p'], m['type'], m['d'], m['q'], m['r'])
-            baselines[key] = m
+            if key not in baselines:
+                baselines[key] = m
+            else:
+                if m['num_det_orders'] > baselines[key]['num_det_orders']:
+                    baselines[key] = m
 
     source_data = {
         'x': [], 'y': [], 'color': [], 'marker': [], 'size': [], 'alpha': [], 'line_color': [], 'line_width': [],
         'p': [], 'type': [], 'd': [], 'q': [], 'r': [], 'op_type': [], 'mode': [], 'order': [], 'beam': [], 'is_baseline': [],
-        'label': [], 'hover_label': [], 'ler_str': [], 'speedup_str': [], 'mid_x': [], 'mid_y': [], 'base_x': [], 'base_y': []
+        'sparsify_errors': [], 'sparsify_reactivate_limit': [], 'beam_climbing': [],
+        'label': [], 'hover_label': [], 'ler_str': [], 'speedup_str': [], 'mid_x': [], 'mid_y': [], 'base_x': [], 'base_y': [],
+        'ler_err_low': [], 'ler_err_high': [], 'base_err_low': [], 'base_err_high': [], 'low_conf_str': []
     }
 
     color_map = {'surfacecodes': '#5D95E8', 'colorcodes': '#F6C644', 'bivariatebicyclecodes': 'fuchsia'}
@@ -76,8 +82,18 @@ def generate_interactive_plot():
         source_data['order'].append(order_val)
         source_data['beam'].append(str(m['beam']) if m['beam'] != 20 else 'longbeam')
         source_data['is_baseline'].append(str(m['is_baseline']))
+        source_data['sparsify_errors'].append(str(m['sparsify_errors']))
+        source_data['sparsify_reactivate_limit'].append(str(m['sparsify_reactivate_limit']))
+        source_data['beam_climbing'].append(str(m['beam_climbing']))
+        source_data['ler_err_low'].append(m['ler_err_low'])
+        source_data['ler_err_high'].append(m['ler_err_high'])
+        total_failures = int(round(m['ler'] * m['shots'] * m['r']))
+        frac = m['num_low_confidence'] / total_failures if total_failures > 0 else 0
+        num_high_conf_errors = max(0, total_failures - m['num_low_confidence'])
+        ler_no_low_conf = num_high_conf_errors / (m['shots'] * m['r']) if (m['shots'] * m['r']) > 0 else 0
+        source_data['low_conf_str'].append(f"{frac*100:.1f}% (LER w/o low-conf: {ler_no_low_conf:.2e})")
 
-        label = "Baseline" if m['is_baseline'] else format_gari_label(m['mode'], m['order'], m['beam'])
+        label = "Baseline" if m['is_baseline'] else format_gari_label(m['mode'], m['order'], m['beam'], m['beam_climbing'], m['sparsify_errors'], m['sparsify_reactivate_limit'])
         source_data['label'].append(label)
         
         short = short_names.get(m['type'], m['type'])
@@ -123,6 +139,8 @@ def generate_interactive_plot():
             source_data['mid_y'].append(mid_y)
             source_data['base_x'].append(x0)
             source_data['base_y'].append(y0)
+            source_data['base_err_low'].append(base_21['ler_err_low'])
+            source_data['base_err_high'].append(base_21['ler_err_high'])
         else:
             source_data['speedup_str'].append("")
             source_data['ler_str'].append("")
@@ -130,11 +148,17 @@ def generate_interactive_plot():
             source_data['mid_y'].append(y1)
             source_data['base_x'].append(x1)
             source_data['base_y'].append(y1)
+            source_data['base_err_low'].append(m['ler_err_low'])
+            source_data['base_err_high'].append(m['ler_err_high'])
 
     source = ColumnDataSource(data=source_data)
 
     line_source = ColumnDataSource(data={'x': [], 'y': []})
     text_source = ColumnDataSource(data={'x': [], 'y': [], 'text': []})
+    
+    # Error bar sources
+    tap_error_source = ColumnDataSource(data={'x': [], 'y0': [], 'y1': [], 'color': []})
+    hover_error_source = ColumnDataSource(data={'x': [], 'y0': [], 'y1': [], 'color': []})
 
     unique_types = sorted(list(set(source_data['type'])))
     unique_modes = sorted(list(set(m for m in source_data['mode'] if m != 'unknown')))
@@ -142,6 +166,8 @@ def generate_interactive_plot():
     unique_op_types = sorted(list(set(source_data['op_type'])))
     unique_beams = sorted(list(set(b for b in source_data['beam'] if b != '0')))
     unique_p = sorted(list(set(source_data['p'])))
+    unique_beam_climbing = sorted(list(set(source_data['beam_climbing'])))
+    unique_sparsify = sorted(list(set(source_data['sparsify_errors'])))
 
     # Native Bokeh UI Controls for Distance
     code_sections = []
@@ -195,6 +221,8 @@ def generate_interactive_plot():
     order_group = CheckboxGroup(labels=unique_orders, active=list(range(len(unique_orders))))
     op_type_group = CheckboxGroup(labels=unique_op_types, active=list(range(len(unique_op_types))))
     beam_group = CheckboxGroup(labels=unique_beams, active=list(range(len(unique_beams))))
+    beam_climbing_group = CheckboxGroup(labels=[f"Beam Climbing: {v}" for v in unique_beam_climbing], active=list(range(len(unique_beam_climbing))))
+    sparsify_group = CheckboxGroup(labels=[f"Sparsify: {v}" for v in unique_sparsify], active=list(range(len(unique_sparsify))))
     p_select = Select(title="Physical Error Rate (p)", value=unique_p[0] if unique_p else "", options=unique_p)
 
     mode_select_all = Button(label="Select All", button_type="success", width=70, height=30, sizing_mode="fixed")
@@ -204,9 +232,12 @@ def generate_interactive_plot():
 
     filter_args = dict(
         mode_group=mode_group, order_group=order_group,
-        op_type_group=op_type_group, beam_group=beam_group, p_select=p_select,
+        op_type_group=op_type_group, beam_group=beam_group,
+        beam_climbing_group=beam_climbing_group, sparsify_group=sparsify_group,
+        p_select=p_select,
         unique_modes=unique_modes, unique_orders=unique_orders,
         unique_op_types=unique_op_types, unique_beams=unique_beams,
+        unique_beam_climbing=unique_beam_climbing, unique_sparsify=unique_sparsify,
         d_chk_keys=d_chk_keys, d_chk_widgets=d_chk_widgets
     )
 
@@ -216,6 +247,8 @@ def generate_interactive_plot():
         const active_orders = order_group.active.map(i => unique_orders[i]);
         const active_op_types = op_type_group.active.map(i => unique_op_types[i]);
         const active_beams = beam_group.active.map(i => unique_beams[i]);
+        const active_beam_climbing = beam_climbing_group.active.map(i => unique_beam_climbing[i]);
+        const active_sparsify = sparsify_group.active.map(i => unique_sparsify[i]);
         const active_p = p_select.value;
         
         let active_td = [];
@@ -243,7 +276,9 @@ def generate_interactive_plot():
                 if (active_modes.includes(source.data['mode'][i]) &&
                     active_orders.includes(source.data['order'][i]) &&
                     active_op_types.includes(source.data['op_type'][i]) &&
-                    active_beams.includes(source.data['beam'][i])) {
+                    active_beams.includes(source.data['beam'][i]) &&
+                    active_beam_climbing.includes(source.data['beam_climbing'][i]) &&
+                    active_sparsify.includes(source.data['sparsify_errors'][i])) {
                     indices.push(i);
                 }
             }
@@ -303,9 +338,12 @@ def generate_interactive_plot():
     update_args = dict(
         source=source, fastest_source=fastest_source, accurate_source=accurate_source,
         mode_group=mode_group, order_group=order_group,
-        op_type_group=op_type_group, beam_group=beam_group, p_select=p_select,
+        op_type_group=op_type_group, beam_group=beam_group, 
+        beam_climbing_group=beam_climbing_group, sparsify_group=sparsify_group,
+        p_select=p_select,
         unique_modes=unique_modes, unique_orders=unique_orders,
         unique_op_types=unique_op_types, unique_beams=unique_beams,
+        unique_beam_climbing=unique_beam_climbing, unique_sparsify=unique_sparsify,
         d_chk_keys=d_chk_keys, d_chk_widgets=d_chk_widgets
     )
 
@@ -314,6 +352,8 @@ def generate_interactive_plot():
         const active_orders = order_group.active.map(i => unique_orders[i]);
         const active_op_types = op_type_group.active.map(i => unique_op_types[i]);
         const active_beams = beam_group.active.map(i => unique_beams[i]);
+        const active_beam_climbing = beam_climbing_group.active.map(i => unique_beam_climbing[i]);
+        const active_sparsify = sparsify_group.active.map(i => unique_sparsify[i]);
         const active_p = p_select.value;
         
         let active_td = [];
@@ -342,7 +382,9 @@ def generate_interactive_plot():
                 if (active_modes.includes(source.data['mode'][i]) &&
                     active_orders.includes(source.data['order'][i]) &&
                     active_op_types.includes(source.data['op_type'][i]) &&
-                    active_beams.includes(source.data['beam'][i])) {
+                    active_beams.includes(source.data['beam'][i]) &&
+                    active_beam_climbing.includes(source.data['beam_climbing'][i]) &&
+                    active_sparsify.includes(source.data['sparsify_errors'][i])) {
                     
                     const x = source.data['x'][i];
                     const y = source.data['y'][i];
@@ -385,7 +427,7 @@ def generate_interactive_plot():
 
     update_js = CustomJS(args=update_args, code=update_js_code)
 
-    for ctrl in [mode_group, order_group, op_type_group, beam_group]:
+    for ctrl in [mode_group, order_group, op_type_group, beam_group, beam_climbing_group, sparsify_group]:
         ctrl.js_on_change('active', update_js)
     p_select.js_on_change('value', update_js)
     
@@ -410,17 +452,43 @@ def generate_interactive_plot():
     p.scatter(x='x', y='y', source=accurate_source, marker='marker', size=20, fill_color=None, line_color='red', line_width=4, alpha=1.0)
 
     p.line(x='x', y='y', source=line_source, color="black", line_dash="dashed", line_width=2, alpha=0.6)
+    p.segment(x0='x', y0='y0', x1='x', y1='y1', source=tap_error_source, color='color', line_width=2, alpha=0.8)
+    p.segment(x0='x', y0='y0', x1='x', y1='y1', source=hover_error_source, color='color', line_width=3, alpha=0.8)
+    
     p.text(x='x', y='y', text='text', source=text_source, text_font_size="9pt",
            x_offset=5, y_offset=5, text_baseline="bottom")
 
     hover = HoverTool(renderers=[scatter], tooltips=[
         ("Config", "@hover_label"),
         ("Time", "@x"),
-        ("LER", "@y")
+        ("LER", "@y"),
+        ("Low Conf Fraction of Errors", "@low_conf_str")
     ])
     p.add_tools(hover)
 
-    tap_js = CustomJS(args=dict(source=source, line_source=line_source, text_source=text_source), code="""
+    hover_js = CustomJS(args=dict(source=source, hover_error_source=hover_error_source), code="""
+        if (cb_data && cb_data.index && cb_data.index.indices.length > 0) {
+            const i = cb_data.index.indices[0];
+            const x = source.data['x'][i];
+            const y = source.data['y'][i];
+            const err_low = source.data['ler_err_low'][i];
+            const err_high = source.data['ler_err_high'][i];
+            const c = source.data['color'][i];
+            hover_error_source.data = {
+                'x': [x],
+                'y0': [y - err_low],
+                'y1': [y + err_high],
+                'color': [c]
+            };
+            hover_error_source.change.emit();
+        } else {
+            hover_error_source.data = {'x': [], 'y0': [], 'y1': [], 'color': []};
+            hover_error_source.change.emit();
+        }
+    """)
+    hover.callback = hover_js
+
+    tap_js = CustomJS(args=dict(source=source, line_source=line_source, text_source=text_source, tap_error_source=tap_error_source), code="""
         const sel = source.selected.indices;
         if (sel.length > 0) {
             const i = sel[0];
@@ -441,6 +509,20 @@ def generate_interactive_plot():
                 
                 text_source.data = {'x': [mid_x], 'y': [mid_y], 'text': [spd + "\\n" + ler]};
                 text_source.change.emit();
+                
+                const err0_low = source.data['base_err_low'][i];
+                const err0_high = source.data['base_err_high'][i];
+                const err1_low = source.data['ler_err_low'][i];
+                const err1_high = source.data['ler_err_high'][i];
+                const c = source.data['color'][i];
+                
+                tap_error_source.data = {
+                    'x': [x0, x1],
+                    'y0': [y0 - err0_low, y1 - err1_low],
+                    'y1': [y0 + err0_high, y1 + err1_high],
+                    'color': [c, c]
+                };
+                tap_error_source.change.emit();
                 return;
             }
         }
@@ -448,6 +530,8 @@ def generate_interactive_plot():
         line_source.change.emit();
         text_source.data = {'x': [], 'y': [], 'text': []};
         text_source.change.emit();
+        tap_error_source.data = {'x': [], 'y0': [], 'y1': [], 'color': []};
+        tap_error_source.change.emit();
     """)
     
     tap = p.select(type=TapTool)
@@ -467,6 +551,10 @@ def generate_interactive_plot():
         op_type_group,
         Div(text="<b>Beams</b>"),
         beam_group,
+        Div(text="<b>Beam Climbing</b>"),
+        beam_climbing_group,
+        Div(text="<b>Sparsify Errors</b>"),
+        sparsify_group,
         width=350
     )
 
@@ -483,7 +571,8 @@ def generate_interactive_plot():
         'modeL': "ez,ex Keep, ey Free, ez',ex' Aggregated",
         'modeM': "ez,ex Keep, ey Free, ez',ex' Maxed",
         'modeN': "ez,ex,ey Keep, ez',ex' XOR Aggregated",
-        'modeO': "ez,ex,ey Scaled, ez',ex' XOR Aggregated"
+        'modeO': "ez,ex,ey Scaled, ez',ex' XOR Aggregated",
+        'modeP': "Minimax Cost-Split (Exact mathematical split, fixes double counting)"
     }
 
     ORDER_DESC = {
@@ -491,15 +580,22 @@ def generate_interactive_plot():
         'order2': "RealX, RealZ, VirtX, VirtZ",
         'order3': "RealX, VirtZ, RealZ, VirtX",
         'order4': "RealX, RealZ, VirtZ, VirtX",
+        'order4r': "VirtZ, VirtX, RealX, RealZ (Virtual First)",
         'order5': "First-Touch Interleaved Chrono",
         'order6': "Last-Touch Interleaved Chrono",
         'order7': "Chrono Real, Chrono Virt",
+        'order7r': "Chrono Virt, Chrono Real (Virtual First)",
         'order7a': "Chrono Real, Chrono Virt (With ey max)",
+        'order7ar': "Chrono Virt, Chrono Real (Virtual First, With ey max)",
         'order7b': "Chrono Real, Chrono Virt min (No ey)",
+        'order7br': "Chrono Virt min, Chrono Real (Virtual First, No ey)",
         'order7c': "Chrono Real, Chrono Virt min (With ey)",
+        'order7cr': "Chrono Virt min, Chrono Real (Virtual First, With ey)",
         'order8': "RealX, VirtX, VirtZ, RealZ",
         'order9': "RealZ, RealX, VirtZ, VirtX",
+        'order9r': "VirtZ, VirtX, RealZ, RealX (Virtual First)",
         'order10': "RealZ, RealX, VirtX, VirtZ",
+        'order10r': "VirtX, VirtZ, RealZ, RealX (Virtual First)",
         'Ensemble of all': "A combination of all multiple detector orders"
     }
 
