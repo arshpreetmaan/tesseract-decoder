@@ -2,10 +2,26 @@ import os
 import json
 import math
 import re
+import argparse
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
+import matplotlib.patches as mpatches
 from scipy.stats import binomtest
 import numpy as np
+
+def parse_max_distance(max_dist_str):
+    if not max_dist_str:
+        return {}
+    try:
+        val = int(max_dist_str)
+        return {'surfacecodes': val, 'colorcodes': val, 'bivariatebicyclecodes': val}
+    except ValueError:
+        res = {}
+        for part in max_dist_str.split(','):
+            if ':' in part:
+                k, v = part.split(':')
+                res[k.strip()] = int(v.strip())
+        return res
 
 def extract_circuit_info(circuit_path):
     info = { 'type': 'unknown', 'r': 1, 'd': 1, 'p': 0.0, 'q': 1 }
@@ -42,13 +58,20 @@ def process_data(filepath):
             info = extract_circuit_info(row.get('circuit_path', ''))
             dem_path = row.get('dem_path', '')
             
-            # Use 'unknown' for custom_order if it was omitted from the JSON (before the C++ fix)
-            custom_order = row.get('custom_order', 'unknown')
-            if custom_order == "": 
-                custom_order = 'unknown'
-
-            beam = row.get('det_beam', 0)
-            num_det_orders = row.get('num_det_orders', 1)
+            if 'det_beam' not in row and 'pqlimit' not in row:
+                decoder = 'simplex'
+                beam = 0
+                custom_order = 'N/A'
+                beam_climbing = False
+                num_det_orders = 1
+            else:
+                decoder = 'tesseract'
+                beam = row.get('det_beam', 0)
+                custom_order = row.get('custom_order', 'unknown')
+                if custom_order == "": 
+                    custom_order = 'unknown'
+                beam_climbing = row.get('beam_climbing', True)
+                num_det_orders = row.get('num_det_orders', 1)
             
             p_val, c_type, d_val, q_val, r_val = info['p'], info['type'], info['d'], info['q'], info['r']
             
@@ -56,17 +79,16 @@ def process_data(filepath):
             is_baseline = (dem_path == "")
             
             # Determine operator type and mode
-            operator_type = 'ogL' if '_ogL_' in dem_path else 'normal'
+            operator_type = 'ogL' if '_ogL_' in dem_path else ''
             mode = 'unknown'
-            m_mode = re.search(r'_(mode[A-Za-z0-9]+)\.dem', dem_path)
+            m_mode = re.search(r'_((?:mode|LP)[A-Za-z0-9]*)\.dem', dem_path)
             if m_mode:
                 mode = m_mode.group(1)
             
             sparsify_errors = row.get('sparsify_errors', False)
             sparsify_reactivate_limit = row.get('sparsify_reactivate_limit', -1)
-            beam_climbing = row.get('beam_climbing', True)
             
-            key = (p_val, c_type, d_val, q_val, r_val, operator_type, mode, custom_order, beam, num_det_orders, is_baseline, sparsify_errors, sparsify_reactivate_limit, beam_climbing)
+            key = (p_val, c_type, d_val, q_val, r_val, operator_type, mode, custom_order, beam, num_det_orders, is_baseline, sparsify_errors, sparsify_reactivate_limit, beam_climbing, decoder)
             
             if key not in data_groups:
                 data_groups[key] = {
@@ -84,7 +106,7 @@ def process_data(filepath):
 def compute_metrics(data_groups):
     metrics = []
     for key, agg in data_groups.items():
-        p_val, c_type, d_val, q_val, r_val, op_type, mode, order, beam, num_det_orders, is_baseline, sparsify_errors, sparsify_reactivate_limit, beam_climbing = key
+        p_val, c_type, d_val, q_val, r_val, op_type, mode, order, beam, num_det_orders, is_baseline, sparsify_errors, sparsify_reactivate_limit, beam_climbing, decoder = key
         shots = agg['num_shots']
         if shots == 0: continue
             
@@ -106,6 +128,7 @@ def compute_metrics(data_groups):
             'num_det_orders': num_det_orders, 'is_baseline': is_baseline,
             'sparsify_errors': sparsify_errors, 'sparsify_reactivate_limit': sparsify_reactivate_limit,
             'beam_climbing': beam_climbing,
+            'decoder': decoder,
             'ler': p_raw / r_val,
             'ler_err_low': ler_err_low,
             'ler_err_high': ler_err_high,
@@ -115,10 +138,13 @@ def compute_metrics(data_groups):
         })
     return metrics
 
-def format_gari_label(mode, order, beam, beam_climbing=True, sparsify_errors=False, sparsify_reactivate_limit=-1):
+def format_gari_label(mode, order, beam, beam_climbing=True, sparsify_errors=False, sparsify_reactivate_limit=-1, decoder='tesseract'):
     m_str = mode.replace('mode', '')
     o_str = order.replace('order', '')
-    beam_str = 'lb' if beam == 20 else f"b{beam}"
+    if beam == 'simplex' or (beam == 0 and decoder == 'simplex'):
+        beam_str = 'simplex'
+    else:
+        beam_str = 'lb' if beam == 20 else f"b{beam}"
     label = f"{m_str}-{o_str}-{beam_str}"
     if not beam_climbing:
         label += "-no_bc"
@@ -130,11 +156,11 @@ def format_gari_label(mode, order, beam, beam_climbing=True, sparsify_errors=Fal
         label += "-nosp"
     return label
 
-def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, title):
+def plot_ler_vs_time(metrics, p_filter, op_filter, c_types, filename, title):
     plt.figure(figsize=(12, 9))
-    filtered = [m for m in metrics if m['p'] == p_filter and m['op_type'] == op_filter and m['type'] == c_type_filter]
+    filtered = [m for m in metrics if m['p'] == p_filter and m['op_type'] == op_filter and m['type'] in c_types]
     # Baselines are shared between both normal and ogL plots
-    baselines = [m for m in metrics if m['p'] == p_filter and m['is_baseline'] and m['type'] == c_type_filter]
+    baselines = [m for m in metrics if m['p'] == p_filter and m['is_baseline'] and m['type'] in c_types]
     
     # Combine uniquely
     combined_metrics = {tuple(m.items()) for m in filtered + baselines}
@@ -151,7 +177,6 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
         circuits[ckey].append(m)
         
     color_map = {'surfacecodes': '#5D95E8', 'colorcodes': '#F6C644', 'bivariatebicyclecodes': 'fuchsia'}
-    base_color = color_map.get(c_type_filter, 'black')
     
     unique_qd = sorted(list(set((c[1], c[2]) for c in circuits.keys())))
     markers = ['o', 's', '^', 'D', 'p', 'h', 'X', '8', '>']
@@ -160,13 +185,14 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
     for ckey, points in circuits.items():
         c_type, c_d, c_q = ckey
         marker = marker_map.get((c_d, c_q), 'o')
+        color = color_map.get(c_type, 'black')
         
         baseline_pts = [p for p in points if p['is_baseline']]
         gari_pts = [p for p in points if not p['is_baseline']]
         
         # Plot GARI cloud
         for p in gari_pts:
-            plt.scatter(p['time_per_round'], p['ler'], color=base_color, marker=marker, alpha=0.3, s=50, zorder=1)
+            plt.scatter(p['time_per_round'], p['ler'], color=color, marker=marker, alpha=0.3, s=50, zorder=1)
             
         # Highlight Fastest and Most Accurate GARI for each beam size
         for b_val in [5, 20]:
@@ -177,10 +203,10 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
                 
                 if b_val == 5:
                     fc = 'white'
-                    ec = base_color
+                    ec = color
                     lw = 2
                 else:
-                    fc = base_color
+                    fc = color
                     ec = 'black'
                     lw = 1.5
 
@@ -189,14 +215,15 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
                     fastest_gari['mode'], fastest_gari['order'], b_val,
                     fastest_gari.get('beam_climbing', True),
                     fastest_gari.get('sparsify_errors', False),
-                    fastest_gari.get('sparsify_reactivate_limit', -1)
+                    fastest_gari.get('sparsify_reactivate_limit', -1),
+                    fastest_gari.get('decoder', 'tesseract')
                 )
                 plt.scatter(fastest_gari['time_per_round'], fastest_gari['ler'], facecolor=fc, edgecolor=ec, 
                             marker='<', s=180, linewidths=lw, zorder=4)
                 plt.errorbar(fastest_gari['time_per_round'], fastest_gari['ler'], yerr=[[fastest_gari['ler_err_low']], [fastest_gari['ler_err_high']]], 
-                             fmt='none', ecolor=base_color, alpha=0.7, capsize=3, zorder=3)
+                             fmt='none', ecolor=color, alpha=0.7, capsize=3, zorder=3)
                 plt.annotate(lbl_fast, (fastest_gari['time_per_round'], fastest_gari['ler']), 
-                             xytext=(-8, 5), textcoords='offset points', ha='right', va='bottom', fontsize=9, color=base_color)
+                             xytext=(-8, 5), textcoords='offset points', ha='right', va='bottom', fontsize=9, color=color)
 
                 # Most Accurate
                 if fastest_gari != most_acc_gari:
@@ -204,25 +231,26 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
                         most_acc_gari['mode'], most_acc_gari['order'], b_val,
                         most_acc_gari.get('beam_climbing', True),
                         most_acc_gari.get('sparsify_errors', False),
-                        most_acc_gari.get('sparsify_reactivate_limit', -1)
+                        most_acc_gari.get('sparsify_reactivate_limit', -1),
+                        most_acc_gari.get('decoder', 'tesseract')
                     )
                     plt.scatter(most_acc_gari['time_per_round'], most_acc_gari['ler'], facecolor=fc, edgecolor=ec, 
                                 marker='v', s=180, linewidths=lw, zorder=4)
                     plt.errorbar(most_acc_gari['time_per_round'], most_acc_gari['ler'], yerr=[[most_acc_gari['ler_err_low']], [most_acc_gari['ler_err_high']]], 
-                                 fmt='none', ecolor=base_color, alpha=0.7, capsize=3, zorder=3)
+                                 fmt='none', ecolor=color, alpha=0.7, capsize=3, zorder=3)
                     plt.annotate(lbl_acc, (most_acc_gari['time_per_round'], most_acc_gari['ler']), 
-                                 xytext=(8, -5), textcoords='offset points', ha='left', va='top', fontsize=9, color=base_color)
+                                 xytext=(8, -5), textcoords='offset points', ha='left', va='top', fontsize=9, color=color)
 
         base_21 = None
         # Plot Baselines
         for p in baseline_pts:
             if p['num_det_orders'] == 1:
-                plt.scatter(p['time_per_round'], p['ler'], facecolor='white', edgecolor=base_color, marker='*', s=400, linewidths=1.5, zorder=5)
-                plt.errorbar(p['time_per_round'], p['ler'], yerr=[[p['ler_err_low']], [p['ler_err_high']]], fmt='none', ecolor=base_color, alpha=0.8, capsize=4, zorder=4)
+                plt.scatter(p['time_per_round'], p['ler'], facecolor='white', edgecolor=color, marker='*', s=400, linewidths=1.5, zorder=5)
+                plt.errorbar(p['time_per_round'], p['ler'], yerr=[[p['ler_err_low']], [p['ler_err_high']]], fmt='none', ecolor=color, alpha=0.8, capsize=4, zorder=4)
             else:
                 base_21 = p
-                plt.scatter(p['time_per_round'], p['ler'], facecolor=base_color, edgecolor='black', marker='*', s=400, linewidths=1.5, zorder=5)
-                plt.errorbar(p['time_per_round'], p['ler'], yerr=[[p['ler_err_low']], [p['ler_err_high']]], fmt='none', ecolor=base_color, alpha=0.8, capsize=4, zorder=4)
+                plt.scatter(p['time_per_round'], p['ler'], facecolor=color, edgecolor='black', marker='*', s=400, linewidths=1.5, zorder=5)
+                plt.errorbar(p['time_per_round'], p['ler'], yerr=[[p['ler_err_low']], [p['ler_err_high']]], fmt='none', ecolor=color, alpha=0.8, capsize=4, zorder=4)
 
         # Draw connecting lines from the 21-order baseline to the ABSOLUTE fastest and ABSOLUTE most accurate GARI points only
         if base_21 and gari_pts:
@@ -238,7 +266,7 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
                 x1, y1 = h['time_per_round'], h['ler']
                 
                 # Plot the line
-                plt.plot([x0, x1], [y0, y1], color=base_color, linestyle='--', linewidth=1.5, alpha=0.5, zorder=2)
+                plt.plot([x0, x1], [y0, y1], color=color, linestyle='--', linewidth=1.5, alpha=0.5, zorder=2)
                 
                 # --- Geometric Midpoint Annotations ---
                 speedup = x0 / x1 if x1 > 0 else 1
@@ -285,11 +313,23 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
     legend_elements = []
     
     # Distance Markers
-    for (d_val, q_val) in unique_qd:
-        mark = marker_map[(d_val, q_val)]
-        label_str = f"d={d_val}" if c_type_filter != 'bivariatebicyclecodes' else f"d={d_val}, q={q_val}"
-        legend_elements.append(mlines.Line2D([0], [0], color='none', marker=mark, markerfacecolor=base_color, markeredgecolor='none', markersize=10, label=label_str))
-        
+    if len(c_types) == 1:
+        base_color = color_map.get(c_types[0], 'black')
+        for (d_val, q_val) in unique_qd:
+            mark = marker_map[(d_val, q_val)]
+            label_str = f"d={d_val}" if c_types[0] != 'bivariatebicyclecodes' else f"d={d_val}, q={q_val}"
+            legend_elements.append(mlines.Line2D([0], [0], color='none', marker=mark, markerfacecolor=base_color, markeredgecolor='none', markersize=10, label=label_str))
+    else:
+        for (d_val, q_val) in unique_qd:
+            mark = marker_map[(d_val, q_val)]
+            label_str = f"d={d_val}, q={q_val}"
+            legend_elements.append(mlines.Line2D([0], [0], color='none', marker=mark, markerfacecolor='gray', markeredgecolor='none', markersize=10, label=label_str))
+            
+        display_names = {'surfacecodes': 'Surface Codes', 'colorcodes': 'Color Codes', 'bivariatebicyclecodes': 'Bicycle Codes'}
+        for c_type in c_types:
+            if any(ck[0] == c_type for ck in circuits.keys()):
+                legend_elements.append(mpatches.Patch(color=color_map.get(c_type, 'black'), label=display_names.get(c_type, c_type)))\
+                
     legend_elements.append(mlines.Line2D([0], [0], color='none', label="")) # Spacer
     
     # Point types
@@ -310,37 +350,77 @@ def plot_ler_vs_time(metrics, p_filter, op_filter, c_type_filter, filename, titl
     plt.close()
 
 if __name__ == '__main__':
-    INPUT_FILE = 'aggregated_results.jsonl'
+    parser = argparse.ArgumentParser(description='Plot GARI benchmarking results.')
+    parser.add_argument('--input', default='aggregated_results.jsonl', help='Path to input JSONL')
+    parser.add_argument('--mode', help='Filter by GARI LP weights mode')
+    parser.add_argument('--max-distance', help='String specifying max distance filters')
+    parser.add_argument('--sparsify-errors', action='store_true', help='If passed, plot only sparsify_errors = True')
+    parser.add_argument('--beam-climbing', action='store_true', help='If passed, plot only beam_climbing = True')
+    parser.add_argument('--beam', help='Filter by beam size (integer or simplex)')
+    parser.add_argument('--decoder', help='Filter by decoder')
+    args = parser.parse_args()
+
+    INPUT_FILE = args.input
     OUTPUT_DIR = 'plots'
     
     if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
         
     data_groups = process_data(INPUT_FILE)
-    metrics = compute_metrics(data_groups)
+    all_metrics = compute_metrics(data_groups)
+    
+    max_distances = parse_max_distance(args.max_distance)
+    
+    metrics = []
+    for m in all_metrics:
+        if m['d'] > max_distances.get(m['type'], float('inf')):
+            continue
+            
+        if not m['is_baseline']:
+            if args.mode is not None and m['mode'] != args.mode:
+                continue
+            if m['sparsify_errors'] != args.sparsify_errors:
+                continue
+            if m['beam_climbing'] != args.beam_climbing:
+                continue
+            if args.beam is not None:
+                if str(args.beam) == 'simplex' and (str(m['beam']) == '0' or m.get('decoder') == 'simplex'):
+                    pass
+                elif str(m['beam']) != str(args.beam):
+                    continue
+            if args.decoder is not None and m.get('decoder', 'tesseract') != args.decoder:
+                continue
+                
+        metrics.append(m)
     
     if len(metrics) > 0:
         print(f"Loaded {len(metrics)} aggregated data points. Generating plots...")
         
-        # Dynamically find all error rates and code types in the JSON lines
+        # Dynamically find all error rates, operation types, and code types in the JSON lines
         unique_p_vals = sorted(list(set(m['p'] for m in metrics)))
+        unique_op_types = sorted(list(set(m['op_type'] for m in metrics)))
         unique_c_types = sorted(list(set(m['type'] for m in metrics)))
         display_names = {'surfacecodes': 'Surface Codes', 'colorcodes': 'Color Codes', 'bivariatebicyclecodes': 'Bicycle Codes'}
         
         for p_val in unique_p_vals:
-            for c_type in unique_c_types:
-                c_name = display_names.get(c_type, c_type)
+            for op_type in unique_op_types:
+                op_title_part = "Original Columns" if op_type == "ogL" else "Operators in Auxiliary Columns"
                 
-                # Exclude 'normal' from filename per user request
-                plot_ler_vs_time(
-                    metrics, p_val, 'normal', c_type,
-                    os.path.join(OUTPUT_DIR, f'ler_vs_time_{c_type}_p{p_val}.png'), 
-                    f'{c_name} - LER vs Time (Operators in Auxiliary Columns, p={p_val})'
-                )
+                for c_type in unique_c_types:
+                    c_name = display_names.get(c_type, c_type)
+                    
+                    # Save a separate plot for each code type
+                    plot_ler_vs_time(
+                        metrics, p_val, op_type, [c_type],
+                        os.path.join(OUTPUT_DIR, f'ler_vs_time_{c_type}_{op_type}_p{p_val}.png'), 
+                        f'{c_name} - LER vs Time ({op_title_part}, p={p_val})'
+                    )
                 
-                # Keep 'ogL' in filename per user request
-                plot_ler_vs_time(
-                    metrics, p_val, 'ogL', c_type,
-                    os.path.join(OUTPUT_DIR, f'ler_vs_time_{c_type}_ogL_p{p_val}.png'), 
-                    f'{c_name} - LER vs Time (Original Columns, p={p_val})'
-                )
+                # Save one merged plot containing all code types
+                if unique_c_types:
+                    merged_title = "Merged Codes"
+                    plot_ler_vs_time(
+                        metrics, p_val, op_type, unique_c_types,
+                        os.path.join(OUTPUT_DIR, f'ler_vs_time_merged_{op_type}_p{p_val}.png'), 
+                        f'{merged_title} - LER vs Time ({op_title_part}, p={p_val})'
+                    )
         print("Done!")

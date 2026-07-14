@@ -16,13 +16,16 @@ bazel build src:tesseract
 
 Generate all the gari dems with all prior modes and detector ordering for the targeted circuits.
 From the repository root:
-```bash
-python3 src/py/gari_dem_utils.py testdata/bivariatebicyclecodes/
-python3 src/py/gari_dem_utils.py testdata/colorcodes/
-python3 src/py/gari_dem_utils.py testdata/surfacecodes/
+# Run DEM Generation under Bazel:
+bazel run //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/bivariatebicyclecodes/"
+bazel run //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/colorcodes/"
+bazel run //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/surfacecodes/"
+
+# Run test simulation under Bazel:
+bazel run //src/py:gari_simulation_test
 ```
 
-The gari_dem_utils requires `numpy`,`scipy`, and `stim`.
+The gari_dem_utils and simulation scripts require `numpy`, `scipy`, `matplotlib`, and `stim`, which are managed by Bazel when run via `bazel run`.
 
 ## Re-running jobs
 
