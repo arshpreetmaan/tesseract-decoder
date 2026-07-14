@@ -3,7 +3,7 @@ import math
 import json
 from plot import process_data, compute_metrics, format_gari_label
 from bokeh.plotting import figure, save, output_file
-from bokeh.models import ColumnDataSource, CustomJS, CustomJSFilter, CDSView, HoverTool, TapTool, CheckboxGroup, Select, Button, Div
+from bokeh.models import ColumnDataSource, CustomJS, CustomJSFilter, CDSView, HoverTool, TapTool, CheckboxGroup, Select, Button, Div, LabelSet
 from bokeh.layouts import column, row
 
 def generate_interactive_plot():
@@ -14,20 +14,16 @@ def generate_interactive_plot():
     # compute tradeoff data for all points
     baselines = {}
     for m in metrics:
-        if m['is_baseline']:
+        if m['is_baseline'] and m.get('num_det_orders', 1) == 1 and m.get('decoder', 'tesseract') == 'tesseract':
             key = (m['p'], m['type'], m['d'], m['q'], m['r'])
-            if key not in baselines:
-                baselines[key] = m
-            else:
-                if m['num_det_orders'] > baselines[key]['num_det_orders']:
-                    baselines[key] = m
+            baselines[key] = m
 
     source_data = {
         'x': [], 'y': [], 'color': [], 'marker': [], 'size': [], 'alpha': [], 'line_color': [], 'line_width': [],
         'p': [], 'type': [], 'd': [], 'q': [], 'r': [], 'op_type': [], 'mode': [], 'order': [], 'beam': [], 'is_baseline': [],
-        'sparsify_errors': [], 'sparsify_reactivate_limit': [], 'beam_climbing': [],
+        'sparsify_errors': [], 'sparsify_reactivate_limit': [], 'beam_climbing': [], 'decoder': [],
         'label': [], 'hover_label': [], 'ler_str': [], 'speedup_str': [], 'mid_x': [], 'mid_y': [], 'base_x': [], 'base_y': [],
-        'ler_err_low': [], 'ler_err_high': [], 'base_err_low': [], 'base_err_high': [], 'low_conf_str': []
+        'ler_err_low': [], 'ler_err_high': [], 'base_err_low': [], 'base_err_high': [], 'low_conf_str': [], 'shots': []
     }
 
     color_map = {'surfacecodes': '#5D95E8', 'colorcodes': '#F6C644', 'bivariatebicyclecodes': 'fuchsia'}
@@ -44,6 +40,9 @@ def generate_interactive_plot():
         if m['mode'] in ['modeB', 'modeC']:
             continue
             
+        if m['is_baseline'] and (m.get('num_det_orders', 1) > 1 or m.get('decoder', 'tesseract') != 'tesseract'):
+            continue
+
         x1, y1 = m['time_per_round'], m['ler']
         if y1 <= 0 or x1 <= 0:
             continue
@@ -80,7 +79,13 @@ def generate_interactive_plot():
         source_data['op_type'].append('Auxiliary Columns' if m['op_type'] == 'normal' else 'Original Columns')
         source_data['mode'].append(m['mode'])
         source_data['order'].append(order_val)
-        source_data['beam'].append(str(m['beam']) if m['beam'] != 20 else 'longbeam')
+        source_data['decoder'].append(m.get('decoder', 'tesseract'))
+        if m['beam'] == 'simplex':
+            source_data['beam'].append('simplex')
+        elif m['beam'] == 20:
+            source_data['beam'].append('longbeam')
+        else:
+            source_data['beam'].append(str(m['beam']))
         source_data['is_baseline'].append(str(m['is_baseline']))
         source_data['sparsify_errors'].append(str(m['sparsify_errors']))
         source_data['sparsify_reactivate_limit'].append(str(m['sparsify_reactivate_limit']))
@@ -92,8 +97,9 @@ def generate_interactive_plot():
         num_high_conf_errors = max(0, total_failures - m['num_low_confidence'])
         ler_no_low_conf = num_high_conf_errors / (m['shots'] * m['r']) if (m['shots'] * m['r']) > 0 else 0
         source_data['low_conf_str'].append(f"{frac*100:.1f}% (LER w/o low-conf: {ler_no_low_conf:.2e})")
+        source_data['shots'].append(str(m['shots']))
 
-        label = "Baseline" if m['is_baseline'] else format_gari_label(m['mode'], m['order'], m['beam'], m['beam_climbing'], m['sparsify_errors'], m['sparsify_reactivate_limit'])
+        label = "Baseline" if m['is_baseline'] else format_gari_label(m['mode'], m['order'], m['beam'], m['beam_climbing'], m['sparsify_errors'], m['sparsify_reactivate_limit'], m.get('decoder', 'tesseract'))
         source_data['label'].append(label)
         
         short = short_names.get(m['type'], m['type'])
@@ -153,13 +159,16 @@ def generate_interactive_plot():
 
     source = ColumnDataSource(data=source_data)
 
-    line_source = ColumnDataSource(data={'x': [], 'y': []})
+    line_source = ColumnDataSource(data={'xs': [], 'ys': []})
     text_source = ColumnDataSource(data={'x': [], 'y': [], 'text': []})
+    tap_details_source = ColumnDataSource(data={'x': [], 'y': [], 'text': [], 'x_offset': [], 'y_offset': [], 'text_align': []})
     
     # Error bar sources
     tap_error_source = ColumnDataSource(data={'x': [], 'y0': [], 'y1': [], 'color': []})
     hover_error_source = ColumnDataSource(data={'x': [], 'y0': [], 'y1': [], 'color': []})
+    selected_baseline_source = ColumnDataSource(data={'x': [], 'y': [], 'color': [], 'marker': []})
 
+    unique_decoders = sorted(list(set(source_data['decoder'])))
     unique_types = sorted(list(set(source_data['type'])))
     unique_modes = sorted(list(set(m for m in source_data['mode'] if m != 'unknown')))
     unique_orders = sorted(list(set(o for o in source_data['order'] if o != 'unknown')))
@@ -183,6 +192,7 @@ def generate_interactive_plot():
         btn = Button(label=f"{name} ▼", button_type="default", width=330, height=30)
         
         d_rows = []
+        family_widgets = {}
         for d in d_list:
             td_val = f"{ct}_{d}"
             d_chk_keys.append(td_val)
@@ -208,15 +218,26 @@ def generate_interactive_plot():
             mark_div = Div(text=f"<div style='color:{c}; font-size:16px; margin-top:-2px;'>{sym}</div>", width=30)
             
             d_chk_widgets[td_val] = chk
+            family_widgets[f"chk_{d}"] = chk
             d_rows.append(row(chk, mark_div, sizing_mode="fixed", width=150, height=30))
             
-        d_col = column(*d_rows, visible=False)
+        select_all_btn = Button(label="Select All", button_type="success", width=100, height=30, sizing_mode="fixed")
+        clear_all_btn = Button(label="Clear All", button_type="primary", width=100, height=30, sizing_mode="fixed")
+        
+        js_select_all = "; ".join([f"{k}.active = [0]" for k in family_widgets.keys()])
+        js_clear_all = "; ".join([f"{k}.active = []" for k in family_widgets.keys()])
+        
+        select_all_btn.js_on_click(CustomJS(args=family_widgets, code=js_select_all))
+        clear_all_btn.js_on_click(CustomJS(args=family_widgets, code=js_clear_all))
+        
+        d_col = column(row(select_all_btn, clear_all_btn), *d_rows, visible=False)
         btn.js_on_click(CustomJS(args=dict(col=d_col), code="col.visible = !col.visible;"))
         code_sections.append(column(btn, d_col))
 
     accordion_container = column(*code_sections)
 
     # General UI Controls
+    decoder_group = CheckboxGroup(labels=[d.capitalize() for d in unique_decoders], active=list(range(len(unique_decoders))))
     mode_group = CheckboxGroup(labels=unique_modes, active=list(range(len(unique_modes))))
     order_group = CheckboxGroup(labels=unique_orders, active=list(range(len(unique_orders))))
     op_type_group = CheckboxGroup(labels=unique_op_types, active=list(range(len(unique_op_types))))
@@ -231,6 +252,7 @@ def generate_interactive_plot():
     order_clear_all = Button(label="Clear All", button_type="primary", width=70, height=30, sizing_mode="fixed")
 
     filter_args = dict(
+        decoder_group=decoder_group, unique_decoders=unique_decoders,
         mode_group=mode_group, order_group=order_group,
         op_type_group=op_type_group, beam_group=beam_group,
         beam_climbing_group=beam_climbing_group, sparsify_group=sparsify_group,
@@ -243,6 +265,7 @@ def generate_interactive_plot():
 
     js_code = """
         const indices = [];
+        const active_decoders = decoder_group.active.map(i => unique_decoders[i]);
         const active_modes = mode_group.active.map(i => unique_modes[i]);
         const active_orders = order_group.active.map(i => unique_orders[i]);
         const active_op_types = op_type_group.active.map(i => unique_op_types[i]);
@@ -262,6 +285,7 @@ def generate_interactive_plot():
 
         for (let i = 0; i < source.get_length(); i++) {
             if (source.data['p'][i] !== active_p) continue;
+            if (!active_decoders.includes(source.data['decoder'][i])) continue;
             
             const t = source.data['type'][i];
             const d = source.data['d'][i];
@@ -273,13 +297,22 @@ def generate_interactive_plot():
             if (is_base) {
                 indices.push(i);
             } else {
-                if (active_modes.includes(source.data['mode'][i]) &&
-                    active_orders.includes(source.data['order'][i]) &&
-                    active_op_types.includes(source.data['op_type'][i]) &&
-                    active_beams.includes(source.data['beam'][i]) &&
-                    active_beam_climbing.includes(source.data['beam_climbing'][i]) &&
-                    active_sparsify.includes(source.data['sparsify_errors'][i])) {
-                    indices.push(i);
+                const dec = source.data['decoder'][i];
+                if (dec === 'simplex') {
+                    if (active_modes.includes(source.data['mode'][i]) &&
+                        active_op_types.includes(source.data['op_type'][i]) &&
+                        active_sparsify.includes(source.data['sparsify_errors'][i])) {
+                        indices.push(i);
+                    }
+                } else {
+                    if (active_modes.includes(source.data['mode'][i]) &&
+                        active_orders.includes(source.data['order'][i]) &&
+                        active_op_types.includes(source.data['op_type'][i]) &&
+                        active_beams.includes(source.data['beam'][i]) &&
+                        active_beam_climbing.includes(source.data['beam_climbing'][i]) &&
+                        active_sparsify.includes(source.data['sparsify_errors'][i])) {
+                        indices.push(i);
+                    }
                 }
             }
         }
@@ -337,6 +370,7 @@ def generate_interactive_plot():
 
     update_args = dict(
         source=source, fastest_source=fastest_source, accurate_source=accurate_source,
+        decoder_group=decoder_group, unique_decoders=unique_decoders,
         mode_group=mode_group, order_group=order_group,
         op_type_group=op_type_group, beam_group=beam_group, 
         beam_climbing_group=beam_climbing_group, sparsify_group=sparsify_group,
@@ -348,6 +382,7 @@ def generate_interactive_plot():
     )
 
     update_js_code = """
+        const active_decoders = decoder_group.active.map(i => unique_decoders[i]);
         const active_modes = mode_group.active.map(i => unique_modes[i]);
         const active_orders = order_group.active.map(i => unique_orders[i]);
         const active_op_types = op_type_group.active.map(i => unique_op_types[i]);
@@ -370,6 +405,7 @@ def generate_interactive_plot():
 
         for (let i = 0; i < source.get_length(); i++) {
             if (source.data['p'][i] !== active_p) continue;
+            if (!active_decoders.includes(source.data['decoder'][i])) continue;
             
             const t = source.data['type'][i];
             const d = source.data['d'][i];
@@ -379,13 +415,22 @@ def generate_interactive_plot():
             
             const is_base = source.data['is_baseline'][i] === 'True';
             if (!is_base) {
-                if (active_modes.includes(source.data['mode'][i]) &&
-                    active_orders.includes(source.data['order'][i]) &&
-                    active_op_types.includes(source.data['op_type'][i]) &&
-                    active_beams.includes(source.data['beam'][i]) &&
-                    active_beam_climbing.includes(source.data['beam_climbing'][i]) &&
-                    active_sparsify.includes(source.data['sparsify_errors'][i])) {
-                    
+                const dec = source.data['decoder'][i];
+                let is_active = false;
+                if (dec === 'simplex') {
+                    is_active = (active_modes.includes(source.data['mode'][i]) &&
+                                 active_op_types.includes(source.data['op_type'][i]) &&
+                                 active_sparsify.includes(source.data['sparsify_errors'][i]));
+                } else {
+                    is_active = (active_modes.includes(source.data['mode'][i]) &&
+                                 active_orders.includes(source.data['order'][i]) &&
+                                 active_op_types.includes(source.data['op_type'][i]) &&
+                                 active_beams.includes(source.data['beam'][i]) &&
+                                 active_beam_climbing.includes(source.data['beam_climbing'][i]) &&
+                                 active_sparsify.includes(source.data['sparsify_errors'][i]));
+                }
+                
+                if (is_active) {
                     const x = source.data['x'][i];
                     const y = source.data['y'][i];
                     
@@ -422,12 +467,36 @@ def generate_interactive_plot():
         fastest_source.change.emit();
         accurate_source.change.emit();
 
+        if (!window.original_legend_items) {
+            window.original_legend_items = legend.items.slice();
+        }
+        
+        const new_legend_items = [];
+        for (let i = 0; i < window.original_legend_items.length; i++) {
+            const item = window.original_legend_items[i];
+            if (item.renderers && item.renderers.length > 0) {
+                const r_name = item.renderers[0].name;
+                if (r_name && r_name.startsWith("fixed_")) {
+                    new_legend_items.push(item);
+                } else if (r_name) {
+                    if (active_td.includes(r_name) && active_decoders.length > 0) {
+                        new_legend_items.push(item);
+                    }
+                } else {
+                    new_legend_items.push(item);
+                }
+            } else {
+                new_legend_items.push(item);
+            }
+        }
+        legend.items = new_legend_items;
+
         source.change.emit();
     """
 
     update_js = CustomJS(args=update_args, code=update_js_code)
 
-    for ctrl in [mode_group, order_group, op_type_group, beam_group, beam_climbing_group, sparsify_group]:
+    for ctrl in [decoder_group, mode_group, order_group, op_type_group, beam_group, beam_climbing_group, sparsify_group]:
         ctrl.js_on_change('active', update_js)
     p_select.js_on_change('value', update_js)
     
@@ -444,22 +513,67 @@ def generate_interactive_plot():
                x_axis_type="log", y_axis_type="log",
                x_axis_label="Time per round (seconds)", y_axis_label="Logical Error Rate per round",
                tools="pan,wheel_zoom,box_zoom,reset,tap,save")
+    p.xaxis.axis_line_color = "black"
+    p.yaxis.axis_line_color = "black"
+    p.xaxis.major_tick_line_color = "black"
+    p.yaxis.major_tick_line_color = "black"
 
-    scatter = p.scatter(x='x', y='y', source=source, view=view, size='size', color='color', line_color='line_color', line_width='line_width', marker='marker', alpha='alpha',
-                        nonselection_alpha=0.1)
+    scatter = p.scatter(x='x', y='y', source=source, view=view, size='size', color='color', line_color='line_color', line_width='line_width', marker='marker', alpha='alpha', nonselection_alpha=0.1)
 
     p.scatter(x='x', y='y', source=fastest_source, marker='marker', size=20, fill_color=None, line_color='green', line_width=4, alpha=1.0)
     p.scatter(x='x', y='y', source=accurate_source, marker='marker', size=20, fill_color=None, line_color='red', line_width=4, alpha=1.0)
+    p.scatter(x='x', y='y', source=selected_baseline_source, marker='marker', size=15, fill_color='color', line_color='black', line_width=2, alpha=1.0)
 
-    p.line(x='x', y='y', source=line_source, color="black", line_dash="dashed", line_width=2, alpha=0.6)
+    p.multi_line(xs='xs', ys='ys', source=line_source, color="black", line_dash="dashed", line_width=2, alpha=0.6)
     p.segment(x0='x', y0='y0', x1='x', y1='y1', source=tap_error_source, color='color', line_width=2, alpha=0.8)
     p.segment(x0='x', y0='y0', x1='x', y1='y1', source=hover_error_source, color='color', line_width=3, alpha=0.8)
     
     p.text(x='x', y='y', text='text', source=text_source, text_font_size="9pt",
            x_offset=5, y_offset=5, text_baseline="bottom")
 
+    details_box = LabelSet(
+        x='x', y='y', text='text', source=tap_details_source,
+        text_font_size="9pt", level="annotation",
+        x_offset='x_offset', y_offset='y_offset',
+        text_align='text_align',
+        border_line_color="#cccccc", border_line_alpha=1.0,
+        background_fill_color="#ffffff", background_fill_alpha=0.95
+    )
+    p.add_layout(details_box)
+
+    # Dummy Glyphs for Combination Legend
+    unique_combos = sorted(list(set(
+        (source_data['type'][i], int(source_data['d'][i]), int(source_data['q'][i])) 
+        for i in range(len(source_data['type']))
+    )), key=lambda x: (x[0], x[1], x[2]))
+
+    legend_renderers = {}
+    for combo in unique_combos:
+        c_type, d, q = combo
+        color = color_map.get(c_type, 'black')
+        marker = marker_map.get((d, q), 'circle')
+        short = short_names.get(c_type, c_type)
+        
+        if c_type == 'bivariatebicyclecodes':
+            label = f"{short}, d={d}, q={q}"
+        else:
+            label = f"{short}, d={d}"
+            
+        renderer = p.scatter(x=[float('nan')], y=[float('nan')], fill_color=color, line_color=color, marker=marker, size=10, legend_label=label, name=f"{c_type}_{d}")
+        legend_renderers[f"{c_type}_{d}"] = renderer
+
+    p.scatter(x=[float('nan')], y=[float('nan')], fill_color='gray', line_color='black', line_width=1.5, marker='circle', size=12, legend_label='Baseline (Black Border)', name="fixed_baseline")
+    p.scatter(x=[float('nan')], y=[float('nan')], fill_color='white', line_color='green', line_width=4, size=12, legend_label='Fastest Gari', name="fixed_fastest")
+    p.scatter(x=[float('nan')], y=[float('nan')], fill_color='white', line_color='red', line_width=4, size=12, legend_label='Most Accurate Gari', name="fixed_accurate")
+
+    update_js.args['legend'] = p.legend[0]
+        
+    p.add_layout(p.legend[0], 'right')
+    p.legend.click_policy = "hide"
+
     hover = HoverTool(renderers=[scatter], tooltips=[
         ("Config", "@hover_label"),
+        ("Decoder", "@decoder"),
         ("Time", "@x"),
         ("LER", "@y"),
         ("Low Conf Fraction of Errors", "@low_conf_str")
@@ -488,50 +602,153 @@ def generate_interactive_plot():
     """)
     hover.callback = hover_js
 
-    tap_js = CustomJS(args=dict(source=source, line_source=line_source, text_source=text_source, tap_error_source=tap_error_source), code="""
+    details_panel = Div(
+        text="<h3>Selected Point Details</h3><p><i>Click on a data point to see details here.</i></p>",
+        width=1000,
+        styles={"padding": "10px", "border": "1px solid #ccc", "background-color": "#f9f9f9", "margin-top": "10px"}
+    )
+
+    tap_js = CustomJS(args=dict(source=source, line_source=line_source, text_source=text_source, tap_error_source=tap_error_source, tap_details_source=tap_details_source, details_panel=details_panel, details_box=details_box, selected_baseline_source=selected_baseline_source), code="""
         const sel = source.selected.indices;
+        const line_xs = [];
+        const line_ys = [];
+        const text_x = [];
+        const text_y = [];
+        const texts = [];
+        const err_x = [];
+        const err_y0 = [];
+        const err_y1 = [];
+        const err_color = [];
+        const det_x = [];
+        const det_y = [];
+        const det_text = [];
+        const det_xoff = [];
+        const det_yoff = [];
+        const det_align = [];
+        const base_xs = [];
+        const base_ys = [];
+        const base_colors = [];
+        const base_markers = [];
+        let panel_html = "<h3>Selected Points Details</h3>";
+
         if (sel.length > 0) {
-            const i = sel[0];
-            const is_base = source.data['is_baseline'][i] === 'True';
-            if (!is_base && source.data['speedup_str'][i] !== "") {
-                const x0 = source.data['base_x'][i];
-                const y0 = source.data['base_y'][i];
+            for (let k = 0; k < sel.length; k++) {
+                const i = sel[k];
+                
+                const decoder = source.data['decoder'][i];
+                const ler = source.data['y'][i].toExponential(4);
+                const beam = source.data['beam'][i];
+                const order = source.data['order'][i];
+                const sp_err = source.data['sparsify_errors'][i];
+                const sp_lim = source.data['sparsify_reactivate_limit'][i];
+                const shots = source.data['shots'][i];
+                const mode = source.data['mode'][i];
+                const ler_err_low = source.data['ler_err_low'][i].toExponential(2);
+                const ler_err_high = source.data['ler_err_high'][i].toExponential(2);
+                const low_conf = source.data['low_conf_str'][i];
+                const hover_lbl = source.data['hover_label'][i];
                 const x1 = source.data['x'][i];
                 const y1 = source.data['y'][i];
+                const time_val = x1.toExponential(4);
+                const ler_val = y1.toExponential(4);
+
+                panel_html += `<h4>Point ${k+1}: ${hover_lbl}</h4>
+                <ul>
+                    <li><b>Decoder:</b> ${decoder}</li>
+                    <li><b>Mode:</b> ${mode}</li>
+                    <li><b>Order:</b> ${order}</li>
+                    <li><b>Beam:</b> ${beam}</li>
+                    <li><b>Sparsify Errors:</b> ${sp_err} (Limit: ${sp_lim})</li>
+                    <li><b>Shots:</b> ${shots}</li>
+                    <li><b>LER:</b> ${ler_val} (-${ler_err_low}, +${ler_err_high})</li>
+                    <li><b>Low Confidence Fraction:</b> ${low_conf}</li>
+                </ul>`;
+
+                const details_text = `Config: ${hover_lbl}\\nDecoder: ${decoder}\\nTime: ${time_val}s\\nLER: ${ler_val} (-${ler_err_low}, +${ler_err_high})\\nLow Conf: ${low_conf}`;
+
+                const is_base = source.data['is_baseline'][i] === 'True';
                 
-                line_source.data = {'x': [x0, x1], 'y': [y0, y1]};
-                line_source.change.emit();
+                let is_faster = false;
+                if (!is_base && source.data['speedup_str'][i] !== "") {
+                    const x0 = source.data['base_x'][i];
+                    if (x1 < x0) {
+                        is_faster = true;
+                    }
+                }
                 
-                const mid_x = source.data['mid_x'][i];
-                const mid_y = source.data['mid_y'][i];
-                const spd = source.data['speedup_str'][i];
-                const ler = source.data['ler_str'][i];
-                
-                text_source.data = {'x': [mid_x], 'y': [mid_y], 'text': [spd + "\\n" + ler]};
-                text_source.change.emit();
-                
-                const err0_low = source.data['base_err_low'][i];
-                const err0_high = source.data['base_err_high'][i];
-                const err1_low = source.data['ler_err_low'][i];
-                const err1_high = source.data['ler_err_high'][i];
-                const c = source.data['color'][i];
-                
-                tap_error_source.data = {
-                    'x': [x0, x1],
-                    'y0': [y0 - err0_low, y1 - err1_low],
-                    'y1': [y0 + err0_high, y1 + err1_high],
-                    'color': [c, c]
-                };
-                tap_error_source.change.emit();
-                return;
+                det_x.push(x1);
+                det_y.push(y1);
+                det_text.push(details_text);
+                det_yoff.push(12);
+
+                if (is_faster) {
+                    det_xoff.push(-12);
+                    det_align.push('right');
+                } else {
+                    det_xoff.push(12);
+                    det_align.push('left');
+                }
+
+                if (!is_base && source.data['speedup_str'][i] !== "") {
+                    const x0 = source.data['base_x'][i];
+                    const y0 = source.data['base_y'][i];
+                    const spd = source.data['speedup_str'][i];
+                    const ler_str = source.data['ler_str'][i];
+                    const mid_x = source.data['mid_x'][i];
+                    const mid_y = source.data['mid_y'][i];
+                    
+                    line_xs.push([x0, x1]);
+                    line_ys.push([y0, y1]);
+                    
+                    text_x.push(mid_x);
+                    text_y.push(mid_y);
+                    texts.push(spd + "\\n" + ler_str);
+                    
+                    const err0_low = source.data['base_err_low'][i];
+                    const err0_high = source.data['base_err_high'][i];
+                    const err1_low = source.data['ler_err_low'][i];
+                    const err1_high = source.data['ler_err_high'][i];
+                    const c = source.data['color'][i];
+                    
+                    err_x.push(x0, x1);
+                    err_y0.push(y0 - err0_low, y1 - err1_low);
+                    err_y1.push(y0 + err0_high, y1 + err1_high);
+                    err_color.push(c, c);
+
+                    base_xs.push(x0);
+                    base_ys.push(y0);
+                    base_colors.push(source.data['color'][i]);
+                    base_markers.push(source.data['marker'][i]);
+                }
             }
+            
+            line_source.data = {'xs': line_xs, 'ys': line_ys};
+            text_source.data = {'x': text_x, 'y': text_y, 'text': texts};
+            tap_error_source.data = {'x': err_x, 'y0': err_y0, 'y1': err_y1, 'color': err_color};
+            tap_details_source.data = {'x': det_x, 'y': det_y, 'text': det_text, 'x_offset': det_xoff, 'y_offset': det_yoff, 'text_align': det_align};
+            selected_baseline_source.data = {'x': base_xs, 'y': base_ys, 'color': base_colors, 'marker': base_markers};
+            
+            line_source.change.emit();
+            text_source.change.emit();
+            tap_error_source.change.emit();
+            tap_details_source.change.emit();
+            selected_baseline_source.change.emit();
+            
+            details_panel.text = panel_html;
+        } else {
+            details_panel.text = "<h3>Selected Point Details</h3><p><i>Click on a data point to see details here.</i></p>";
+            line_source.data = {'xs': [], 'ys': []};
+            text_source.data = {'x': [], 'y': [], 'text': []};
+            tap_error_source.data = {'x': [], 'y0': [], 'y1': [], 'color': []};
+            tap_details_source.data = {'x': [], 'y': [], 'text': [], 'x_offset': [], 'y_offset': [], 'text_align': []};
+            selected_baseline_source.data = {'x': [], 'y': [], 'color': [], 'marker': []};
+            
+            line_source.change.emit();
+            text_source.change.emit();
+            tap_error_source.change.emit();
+            tap_details_source.change.emit();
+            selected_baseline_source.change.emit();
         }
-        line_source.data = {'x': [], 'y': []};
-        line_source.change.emit();
-        text_source.data = {'x': [], 'y': [], 'text': []};
-        text_source.change.emit();
-        tap_error_source.data = {'x': [], 'y0': [], 'y1': [], 'color': []};
-        tap_error_source.change.emit();
     """)
     
     tap = p.select(type=TapTool)
@@ -539,6 +756,8 @@ def generate_interactive_plot():
 
     controls = column(
         p_select,
+        Div(text="<b>Decoder</b>"),
+        decoder_group,
         Div(text="<b>Code Types & Distances</b>"),
         accordion_container,
         Div(text="<b>Prior Modes</b>"),
@@ -572,7 +791,13 @@ def generate_interactive_plot():
         'modeM': "ez,ex Keep, ey Free, ez',ex' Maxed",
         'modeN': "ez,ex,ey Keep, ez',ex' XOR Aggregated",
         'modeO': "ez,ex,ey Scaled, ez',ex' XOR Aggregated",
-        'modeP': "Minimax Cost-Split (Exact mathematical split, fixes double counting)"
+        'modeP': "Minimax Cost-Split (Exact mathematical split, fixes double counting)",
+        'modeS': "LP Mode",
+        'modeS2': "LP Mode",
+        'modeSO': "LP Mode",
+        'modeSO2': "LP Mode",
+        'modeU': "LP Mode",
+        'modeV': "LP Mode"
     }
 
     ORDER_DESC = {
@@ -602,6 +827,8 @@ def generate_interactive_plot():
     modes_html = ""
     for m in unique_modes:
         desc = MODE_DESC.get(m, "Unknown Mode")
+        if desc == "Unknown Mode" and (m.startswith("mode") or m.startswith("LP")):
+            desc = "LP Mode"
         modes_html += f"<li><b>{m}:</b> {desc}</li>\n"
 
     orders_html = ""
@@ -616,6 +843,7 @@ def generate_interactive_plot():
                 <li><b>Baseline:</b> <span style='border:2px solid black; padding: 0 4px;'>Black Border</span> (Default: Longbeam, 1 Order, Normal Op).</li>
                 <li><b>Highlights:</b> <span style='border:2px solid green; padding: 0 4px;'>Green Border</span> = Fastest Gari (Current View). <span style='border:2px solid red; padding: 0 4px;'>Red Border</span> = Most Accurate Gari (Current View).</li>
                 <li><b>Gari Simulations:</b> Uses 1 detector order and <code>no-det-revisit=False</code> for A* Search.</li>
+                <li><b>Configuration Format:</b> <code>[Mode]-[Order]-[Beamsize]-[beam-climbing(optional)]-[sparsification]-[code and distance]</code> (Example: <code>SO2-7-lb-sp(10)-[sc, d=5]</code>)</li>
             </ul>
             <div style='display: flex; gap: 40px;'>
                 <div>
@@ -635,7 +863,7 @@ def generate_interactive_plot():
     """
     manual_div = Div(text=manual_div_str)
 
-    layout = column(row(controls, p), manual_div)
+    layout = column(row(controls, p), manual_div, details_panel)
 
     output_dir = 'plots'
     if not os.path.exists(output_dir):
