@@ -76,7 +76,7 @@ done | shuf | while read circuit; do
   #  $TESSERACT_BIN --circuit "$circuit" --sample-num-shots $SHOTS --sample-seed $SEED --max-errors 100 --threads 32 --beam 20 --beam-climbing --num-det-orders 21 --det-order-index --pqlimit 1000000 --dem "$dem_file" --det-mapping-file "$mapping_file" --stats-out out/${STARTTIME}-${COUNTER}-gari-revisit-21det.json
 
 #    $TESSERACT_BIN --circuit "$circuit" --sample-num-shots 1000 --sample_seed $SEED --max-errors 10 --threads 32 --no-revisit-dets --beam 20 --beam-climbing --num-det-orders 1 --det-order-index --pqlimit 1000000 --dem "$dem_file" —det-mapping-file "$mapping_file" —stats-out out/${STARTTIME}-${COUNTER}.json
-
+./bazel-bin/src/tesseract_trellis --circuit path/to/circuit.stim --sample-num-shots 1000 --sample-seed 1234 --threads 1 --ranking-mode future-detcost --beam 1024
   # Increment counter for every single job so JSON files don't get overwritten
   COUNTER=$((COUNTER + 1))
 done

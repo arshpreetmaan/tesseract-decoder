@@ -58,6 +58,7 @@ struct TesseractTrellisConfig {
   bool merge_errors = true;
   bool track_kept_state_stats = false;
   TesseractTrellisRankingMode ranking_mode = TesseractTrellisRankingMode::MassOnly;
+  std::vector<uint64_t> det_mapping;
 };
 
 struct TesseractTrellisDecoder {

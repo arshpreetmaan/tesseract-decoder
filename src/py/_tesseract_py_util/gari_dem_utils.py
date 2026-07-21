@@ -762,6 +762,19 @@ def process_directory(input_path):
             #     "modeO", "modeP", "modeQ", "modeR", "modeS", "modeU",
             #     "modeV", "modeS2", "modeSO", "modeSO2"
             # ]
+            nx = gari_structure["nx_virt"]
+            nz = gari_structure["nz_virt"]
+            ny = gari_structure["U"].shape[1]
+            num_base = nx + nz + ny
+            num_routing = nx + nz
+            col_order = np.concatenate([
+                np.arange(num_base, num_base + num_routing),
+                np.arange(0, num_base)
+            ])
+            gari_matrix_rev = gari_matrix[:, col_order]
+            gari_obs_matrix_rev = gari_obs_matrix[:, col_order]
+            gari_obs_matrix_og_rev = gari_obs_matrix_og[:, col_order]
+
             modes_to_generate = [
                 "modeA", "modeN",
                 "modeO", "modeQ", "modeR", "modeS", "modeS2", "modeSO", "modeSO2"
@@ -775,6 +788,12 @@ def process_directory(input_path):
                     
                     dem_for_mode_og = matrices_to_dem(gari_matrix, gari_obs_matrix_og, priors_for_mode)
                     dem_for_mode_og.to_file(base_path + f"_ogL_{mode_name}.dem")
+
+                    priors_rev = priors_for_mode[col_order]
+                    dem_rev = matrices_to_dem(gari_matrix_rev, gari_obs_matrix_rev, priors_rev)
+                    dem_rev.to_file(base_path + f"_{mode_name}_garirev.dem")
+                    dem_rev_og = matrices_to_dem(gari_matrix_rev, gari_obs_matrix_og_rev, priors_rev)
+                    dem_rev_og.to_file(base_path + f"_ogL_{mode_name}_garirev.dem")
                 except NotImplementedError as e:
                     print(f"Skipping {mode_name}: {e}")
             

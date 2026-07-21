@@ -42,6 +42,7 @@ TesseractTrellisRankingMode parse_ranking_mode(const std::string& value) {
 struct Args {
   std::string circuit_path;
   std::string dem_path;
+  std::string det_mapping_file;
   bool no_merge_errors = false;
 
   size_t sample_num_shots = 0;
@@ -162,6 +163,15 @@ struct Args {
           /*block_decomposition_from_introducing_remnant_edges=*/false);
     }
 
+    if (!det_mapping_file.empty()) {
+      std::ifstream f(det_mapping_file);
+      if (!f) {
+        throw std::invalid_argument("Could not open the mapping file: " + det_mapping_file);
+      }
+      nlohmann::json j = nlohmann::json::parse(f);
+      config.det_mapping = j.at("mapping").get<std::vector<uint64_t>>();
+    }
+
     config.merge_errors = !no_merge_errors;
     config.beam_width = beam_width;
     config.beam_eps = beam_eps;
@@ -262,6 +272,7 @@ int main(int argc, char* argv[]) {
   Args args;
   program.add_argument("--circuit").help("Stim circuit file path").store_into(args.circuit_path);
   program.add_argument("--dem").help("Stim dem file path").store_into(args.dem_path);
+  program.add_argument("--det-mapping-file").help("JSON file containing detector mapping").default_value(std::string("")).store_into(args.det_mapping_file);
   program.add_argument("--no-merge-errors")
       .help("If provided, will not merge identical error mechanisms.")
       .store_into(args.no_merge_errors);
@@ -381,7 +392,20 @@ int main(int argc, char* argv[]) {
         }
         auto& decoder = *decoders[thread_index];
         auto start_time = std::chrono::high_resolution_clock::now();
-        decoder.decode_shot(shots[shot_index].hits);
+        std::vector<uint64_t> mapped_hits;
+        const std::vector<uint64_t>* hits_to_decode = &shots[shot_index].hits;
+        if (!config.det_mapping.empty()) {
+          mapped_hits.reserve(shots[shot_index].hits.size());
+          for (uint64_t raw_hit : shots[shot_index].hits) {
+            if (raw_hit < config.det_mapping.size()) {
+              mapped_hits.push_back(config.det_mapping[raw_hit]);
+            } else {
+              throw std::out_of_range("Detector hit out of bounds for det_mapping");
+            }
+          }
+          hits_to_decode = &mapped_hits;
+        }
+        decoder.decode_shot(*hits_to_decode);
         auto stop_time = std::chrono::high_resolution_clock::now();
         decoding_time_seconds[shot_index] =
             std::chrono::duration_cast<std::chrono::microseconds>(stop_time - start_time).count() /
