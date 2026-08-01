@@ -58,7 +58,6 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   EXPECT_EQ(result.physical_errors, (std::vector<size_t>{2}));
   EXPECT_EQ(result.observables, (std::vector<int>{0, 1}));
   EXPECT_NEAR(result.physical_cost, -std::log(0.05 / 0.95), EPSILON);
-  EXPECT_EQ(result.winner_trial, 0);
   EXPECT_EQ(result.unique_debts, 1);
   EXPECT_EQ(result.bottom_cache_hits, 1);
 }

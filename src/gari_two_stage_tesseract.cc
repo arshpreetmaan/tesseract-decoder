@@ -1,7 +1,6 @@
 #include "gari_two_stage_tesseract.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <random>
@@ -12,8 +11,6 @@
 #include <utility>
 
 namespace {
-
-using Clock = std::chrono::steady_clock;
 
 struct VectorHash {
   size_t operator()(const std::vector<uint64_t>& values) const {
@@ -309,15 +306,11 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
     const size_t top_beam = trial;
     const size_t top_detector_order = trial % config_.num_top_detector_orders;
 
-    auto start = Clock::now();
     top_decoder_->decode_to_errors(top_detections, top_detector_order, top_beam);
-    result.top_runtime_seconds += std::chrono::duration<double>(Clock::now() - start).count();
-    result.top_queue_pushes += top_decoder_->last_search_stats.queue_pushes;
 
     if (top_decoder_->low_confidence_flag) {
       continue;
     }
-    ++result.top_completions;
     if (!reproduces_syndrome(top_error_detectors_, top_decoder_->predicted_errors_buffer,
                              top_detections, layout.physical_detector_count)) {
       throw std::runtime_error("Completed top GARI candidate does not reproduce its syndrome.");
@@ -343,11 +336,7 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       ++result.bottom_cache_hits;
       outcome = cached->second;
     } else {
-      start = Clock::now();
       bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0, config_.bottom_beam);
-      result.bottom_runtime_seconds +=
-          std::chrono::duration<double>(Clock::now() - start).count();
-      result.bottom_queue_pushes += bottom_decoder_->last_search_stats.queue_pushes;
 
       outcome.completed = !bottom_decoder_->low_confidence_flag;
       if (outcome.completed) {
@@ -366,7 +355,6 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
     if (!outcome.completed) {
       continue;
     }
-    ++result.bottom_completions;
 
     if (outcome.cost < result.physical_cost) {
       result.completed = true;
@@ -374,9 +362,6 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       result.observables = std::move(outcome.observables);
       result.top_errors = top_decoder_->predicted_errors_buffer;
       result.physical_errors = std::move(outcome.errors);
-      result.winner_trial = trial;
-      result.winner_top_detector_order = top_detector_order;
-      result.winner_top_beam = top_beam;
     }
   }
   result.unique_debts = bottom_cache.size();

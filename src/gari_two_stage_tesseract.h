@@ -44,18 +44,8 @@ struct GariTwoStageDecodeResult {
   std::vector<size_t> top_errors;
   std::vector<size_t> physical_errors;
 
-  size_t top_completions = 0;
-  size_t bottom_completions = 0;
   size_t unique_debts = 0;
   size_t bottom_cache_hits = 0;
-  size_t top_queue_pushes = 0;
-  size_t bottom_queue_pushes = 0;
-  double top_runtime_seconds = 0;
-  double bottom_runtime_seconds = 0;
-
-  size_t winner_trial = std::numeric_limits<size_t>::max();
-  size_t winner_top_detector_order = std::numeric_limits<size_t>::max();
-  size_t winner_top_beam = std::numeric_limits<size_t>::max();
 };
 
 // Runs a fresh top search at every beam/order trial, then completes each top

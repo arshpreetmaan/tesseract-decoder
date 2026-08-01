@@ -232,7 +232,7 @@ struct Args {
     if (sample_num_shots > 0 and circuit_path.empty()) {
       throw std::invalid_argument("Cannot sample shots without a circuit.");
     }
-    if (beam_climbing and det_beam == INF_DET_BEAM) {
+    if (beam_climbing && !gari_two_stage && det_beam == INF_DET_BEAM) {
       throw std::invalid_argument("Beam climbing requires a finite beam");
     }
 
@@ -241,11 +241,11 @@ struct Args {
         throw std::invalid_argument(
             "--gari-two-stage requires --dem and --det-mapping-file");
       }
-      if (!custom_order.empty() || det_order_coordinate || beam_climbing || no_revisit_dets ||
-          sparsify_errors || det_penalty != 0 || !dem_out_fname.empty()) {
+      if (!custom_order.empty() || det_order_coordinate || no_revisit_dets || sparsify_errors ||
+          det_penalty != 0 || !dem_out_fname.empty()) {
         throw std::invalid_argument(
-            "GARI two-stage decoding does not use custom/coordinate orders, internal beam "
-            "climbing, no-revisit, detector penalties, sparsification, or --dem-out");
+            "GARI two-stage decoding does not use custom/coordinate orders, no-revisit, "
+            "detector penalties, sparsification, or --dem-out");
       }
       if (!program.is_used("--beam")) {
         det_beam = 20;
@@ -260,6 +260,9 @@ struct Args {
       if (num_det_orders == 0) {
         throw std::invalid_argument("--num-det-orders must be at least 1");
       }
+      // The two-stage outer loop is the beam-climbing loop. Child decoders keep
+      // their internal beam climbing disabled.
+      beam_climbing = true;
     }
 
     bool has_base = program.is_used("--sparsify-base-degree");
@@ -524,7 +527,7 @@ int main(int argc, char* argv[]) {
   program.add_argument("--det-mapping-file").help("JSON file containing detector mapping").default_value(std::string("")).store_into(args.det_mapping_file);
   program.add_argument("--custom-order").help("Specific detector order to use from mapping JSON (e.g. 'order5' or 'all')").default_value(std::string("")).store_into(args.custom_order);
   program.add_argument("--gari-two-stage")
-      .help("Split a monolithic GARI physical-logical mode-N DEM in memory")
+      .help("Split a GARI physical-logical mode-N DEM and use outer beam climbing")
       .flag()
       .store_into(args.gari_two_stage);
   program.add_argument("--gari-bottom-beam")
@@ -746,8 +749,9 @@ int main(int argc, char* argv[]) {
   const stim::DetectorErrorModel original_dem = config.dem.flattened();
   std::vector<std::unique_ptr<TesseractDecoder>> decoders(args.num_threads);
   std::vector<std::unique_ptr<GariTwoStageTesseractDecoder>> gari_decoders(args.num_threads);
-  std::vector<GariTwoStageDecodeResult> gari_results(
-      args.gari_two_stage && !args.stats_out_fname.empty() ? shots.size() : 0);
+  const bool collect_gari_stats = args.gari_two_stage && !args.stats_out_fname.empty();
+  std::vector<size_t> gari_unique_debts(collect_gari_stats ? shots.size() : 0);
+  std::vector<size_t> gari_bottom_cache_hits(collect_gari_stats ? shots.size() : 0);
   GariTwoStageConfig gari_config;
   auto decoder_setup_start = std::chrono::high_resolution_clock::now();
   try {
@@ -795,8 +799,9 @@ int main(int argc, char* argv[]) {
           }
           low_confidence[shot_index] = !result.completed;
           cost_predicted[shot_index] = result.physical_cost;
-          if (!args.stats_out_fname.empty()) {
-            gari_results[shot_index] = std::move(result);
+          if (collect_gari_stats) {
+            gari_unique_debts[shot_index] = result.unique_debts;
+            gari_bottom_cache_hits[shot_index] = result.bottom_cache_hits;
           }
         } else {
           auto& decoder = *decoders[thread_index];
@@ -897,7 +902,6 @@ int main(int argc, char* argv[]) {
         {"pqlimit", args.pqlimit},
         {"num_det_orders", args.num_det_orders},
         {"det_order_seed", args.det_order_seed},
-        {"decoder_setup_time_seconds", decoder_setup_time_seconds},
         {"total_time_seconds", total_time_seconds},
         {"num_errors", num_errors},
         {"num_low_confidence", num_low_confidence},
@@ -910,63 +914,13 @@ int main(int argc, char* argv[]) {
         {"sparsify_reactivate_limit", effective_sparsify_reactivate_limit}};
 
     if (args.gari_two_stage) {
-      size_t top_completions = 0;
-      size_t bottom_completions = 0;
-      size_t unique_debts = 0;
-      size_t bottom_cache_hits = 0;
-      size_t top_queue_pushes = 0;
-      size_t bottom_queue_pushes = 0;
-      double top_runtime_seconds = 0;
-      double bottom_runtime_seconds = 0;
-      nlohmann::json shot_stats = nlohmann::json::array();
-      for (size_t k = 0; k < shot; ++k) {
-        const auto& result = gari_results[k];
-        nlohmann::json winner = nullptr;
-        nlohmann::json physical_cost = nullptr;
-        if (result.completed) {
-          winner = {{"trial", result.winner_trial},
-                    {"top_detector_order", result.winner_top_detector_order},
-                    {"top_beam", result.winner_top_beam}};
-          physical_cost = result.physical_cost;
-        }
-        shot_stats.push_back({
-            {"completed", result.completed},
-            {"physical_cost", physical_cost},
-            {"observables", result.observables},
-            {"winner", winner},
-            {"top_completions", result.top_completions},
-            {"bottom_completions", result.bottom_completions},
-            {"unique_debts", result.unique_debts},
-            {"bottom_cache_hits", result.bottom_cache_hits},
-            {"top_runtime_seconds", result.top_runtime_seconds},
-            {"bottom_runtime_seconds", result.bottom_runtime_seconds},
-            {"top_queue_pushes", result.top_queue_pushes},
-            {"bottom_queue_pushes", result.bottom_queue_pushes},
-        });
-        top_completions += result.top_completions;
-        bottom_completions += result.bottom_completions;
-        unique_debts += result.unique_debts;
-        bottom_cache_hits += result.bottom_cache_hits;
-        top_runtime_seconds += result.top_runtime_seconds;
-        bottom_runtime_seconds += result.bottom_runtime_seconds;
-        top_queue_pushes += result.top_queue_pushes;
-        bottom_queue_pushes += result.bottom_queue_pushes;
-      }
       stats_json["gari_two_stage"] = {
-          {"max_top_beam", args.det_beam},
-          {"num_top_detector_orders", args.num_det_orders},
-          {"top_detector_order_method",
-           args.det_order_bfs ? "bfs" : (args.det_order_coordinate ? "coordinate" : "index")},
           {"bottom_beam", args.gari_bottom_beam},
-          {"top_completions", top_completions},
-          {"bottom_completions", bottom_completions},
-          {"total_unique_debts_across_shots", unique_debts},
-          {"bottom_cache_hits", bottom_cache_hits},
-          {"top_runtime_seconds", top_runtime_seconds},
-          {"bottom_runtime_seconds", bottom_runtime_seconds},
-          {"top_queue_pushes", top_queue_pushes},
-          {"bottom_queue_pushes", bottom_queue_pushes},
-          {"shots", std::move(shot_stats)},
+          {"total_unique_debts_across_shots",
+           std::accumulate(gari_unique_debts.begin(), gari_unique_debts.begin() + shot, size_t{0})},
+          {"bottom_cache_hits",
+           std::accumulate(gari_bottom_cache_hits.begin(),
+                           gari_bottom_cache_hits.begin() + shot, size_t{0})},
       };
     }
 

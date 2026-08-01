@@ -375,7 +375,6 @@ void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections,
 void TesseractDecoder::decode_to_errors_with_graph(
     const std::vector<uint64_t>& detections, size_t detector_order, size_t detector_beam,
     const std::vector<std::vector<int>>& active_d2e) {
-  last_search_stats = {};
   predicted_errors_buffer.clear();
   low_confidence_flag = false;
   error_chain_arena.clear();
@@ -421,7 +420,7 @@ void TesseractDecoder::decode_to_errors_with_graph(
   std::vector<DetectorCostTuple> next_detector_cost_tuples;
 
   pq.push({initial_cost, min_num_dets, 0, -1});
-  ++last_search_stats.queue_pushes;
+  size_t num_pq_pushed = 1;
 
   while (!pq.empty()) {
     const Node node = pq.top();
@@ -456,7 +455,7 @@ void TesseractDecoder::decode_to_errors_with_graph(
         std::cout << std::endl;
         std::cout.precision(13);
         std::cout << "Decoding complete. Cost: " << node.cost
-                  << " num_pq_pushed = " << last_search_stats.queue_pushes << std::endl;
+                  << " num_pq_pushed = " << num_pq_pushed << std::endl;
       }
       predicted_errors_buffer.resize(node.depth);
       int64_t walker_idx = node.error_chain_idx;
@@ -477,8 +476,7 @@ void TesseractDecoder::decode_to_errors_with_graph(
     }
     if (config.verbose) {
       std::cout.precision(13);
-      std::cout << "len(pq) = " << pq.size()
-                << " num_pq_pushed = " << last_search_stats.queue_pushes << std::endl;
+      std::cout << "len(pq) = " << pq.size() << " num_pq_pushed = " << num_pq_pushed << std::endl;
       std::cout << "num_dets = " << node.num_dets << " max_num_dets = " << max_num_dets
                 << " cost = " << node.cost << std::endl;
       std::cout << "activated_errors = ";
@@ -591,9 +589,9 @@ void TesseractDecoder::decode_to_errors_with_graph(
       next_node.parent_idx = node.error_chain_idx;
 
       pq.push({next_cost, next_num_dets, node.depth + 1, (int64_t)(error_chain_arena.size() - 1)});
-      ++last_search_stats.queue_pushes;
+      ++num_pq_pushed;
 
-      if (last_search_stats.queue_pushes > config.pqlimit) {
+      if (num_pq_pushed > config.pqlimit) {
         if (config.verbose) {
           std::cout << "setting low confidence flag" << std::endl;
         }
