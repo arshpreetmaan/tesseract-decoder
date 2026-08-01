@@ -77,6 +77,10 @@ struct ErrorCost {
   double min_cost;
 };
 
+struct TesseractSearchStats {
+  size_t queue_pushes = 0;
+};
+
 struct TesseractDecoder {
   TesseractConfig config;
   Visualizer visualizer;
@@ -105,6 +109,8 @@ struct TesseractDecoder {
                     std::vector<std::vector<int>>& obs_predicted);
 
   bool low_confidence_flag = false;
+  // Statistics from the most recent single detector-order/beam search.
+  TesseractSearchStats last_search_stats;
   std::vector<size_t> predicted_errors_buffer;
   std::vector<size_t> dem_error_to_error;
   std::vector<size_t> error_to_dem_error;
