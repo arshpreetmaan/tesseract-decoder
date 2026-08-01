@@ -140,12 +140,26 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "libgari_two_stage_tesseract",
+    srcs = ["gari_two_stage_tesseract.cc"],
+    hdrs = ["gari_two_stage_tesseract.h"],
+    copts = OPT_COPTS,
+    linkopts = OPT_LINKOPTS,
+    deps = [
+        ":libtesseract",
+        ":libutils",
+        "@stim//:stim_lib",
+    ],
+)
+
 cc_binary(
     name = "tesseract",
     srcs = ["tesseract_main.cc"],
     copts = OPT_COPTS,
     linkopts = OPT_LINKOPTS,
     deps = [
+        ":libgari_two_stage_tesseract",
         ":libtesseract",
         "@argparse",
         "@nlohmann_json//:json",
@@ -160,6 +174,7 @@ cc_test(
     copts = OPT_COPTS,
     linkopts = OPT_LINKOPTS,
     deps = [
+        ":libgari_two_stage_tesseract",
         ":libsimplex",
         ":libtesseract",
         ":libutils",

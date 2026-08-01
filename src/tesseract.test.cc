@@ -14,16 +14,54 @@
 
 #include "tesseract.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <vector>
 
+#include "gari_two_stage_tesseract.h"
 #include "gtest/gtest.h"
 #include "simplex.h"
 #include "stim.h"
 #include "utils.h"
 
 constexpr uint64_t test_data_seed = 752024;
+
+TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
+  stim::DetectorErrorModel dem(R"DEM(
+    error(0.1) D2 L0
+    error(0.2) D3 L1
+    error(0.05) D2 D3 L0 L1
+    error(0.1) D0 D2
+    error(0.2) D1 D3
+  )DEM");
+  GariTwoStageConfig config;
+  config.layout = {
+      .physical_detector_count = 2,
+      .virtual_detector_count = 2,
+      .physical_error_count = 3,
+      .barred_error_count = 2,
+      .barred_error_to_virtual_detector = {2, 3},
+  };
+  config.max_top_beam = 1;
+  config.num_top_detector_orders = 2;
+  config.bottom_beam = 2;
+  config.source_to_top_detector = {1, 0};
+
+  GariTwoStageTesseractDecoder decoder(dem, config);
+  auto result = decoder.decode({0, 1});
+
+  ASSERT_TRUE(result.completed);
+  std::sort(result.top_errors.begin(), result.top_errors.end());
+  EXPECT_EQ(result.top_errors, (std::vector<size_t>{0, 1}));
+  EXPECT_EQ(result.physical_errors, (std::vector<size_t>{2}));
+  EXPECT_EQ(result.observables, (std::vector<int>{0, 1}));
+  EXPECT_NEAR(result.physical_cost, -std::log(0.05 / 0.95), EPSILON);
+  EXPECT_EQ(result.winner_trial, 0);
+  EXPECT_EQ(result.unique_debts, 1);
+  EXPECT_EQ(result.bottom_cache_hits, 1);
+}
 
 bool simplex_test_compare(stim::DetectorErrorModel& dem, std::vector<stim::SparseShot>& shots) {
   TesseractConfig tesseract_config{dem};

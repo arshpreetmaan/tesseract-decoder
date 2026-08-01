@@ -98,6 +98,13 @@ target_include_directories(tesseract_lib PUBLIC ${TESSERACT_SRC_DIR})
 target_compile_options(tesseract_lib PRIVATE ${OPT_COPTS})
 target_link_libraries(tesseract_lib PUBLIC utils boost_headers visualization)
 
+add_library(gari_two_stage_tesseract
+  ${TESSERACT_SRC_DIR}/gari_two_stage_tesseract.cc
+  ${TESSERACT_SRC_DIR}/gari_two_stage_tesseract.h)
+target_include_directories(gari_two_stage_tesseract PUBLIC ${TESSERACT_SRC_DIR})
+target_compile_options(gari_two_stage_tesseract PRIVATE ${OPT_COPTS})
+target_link_libraries(gari_two_stage_tesseract PUBLIC tesseract_lib utils libstim)
+
 add_library(simplex ${TESSERACT_SRC_DIR}/simplex.cc ${TESSERACT_SRC_DIR}/simplex.h)
 target_include_directories(simplex PUBLIC ${TESSERACT_SRC_DIR})
 target_compile_options(simplex PRIVATE ${OPT_COPTS})
@@ -106,7 +113,7 @@ target_link_libraries(simplex PUBLIC common utils tesseract_lib highs libstim Th
 # === Executables ===
 add_executable(tesseract ${TESSERACT_SRC_DIR}/tesseract_main.cc)
 target_compile_options(tesseract PRIVATE ${OPT_COPTS})
-target_link_libraries(tesseract PRIVATE tesseract_lib argparse::argparse nlohmann_json::nlohmann_json)
+target_link_libraries(tesseract PRIVATE gari_two_stage_tesseract argparse::argparse nlohmann_json::nlohmann_json)
 
 add_executable(simplex_bin ${TESSERACT_SRC_DIR}/simplex_main.cc)
 set_target_properties(simplex_bin PROPERTIES OUTPUT_NAME simplex)
@@ -134,6 +141,5 @@ target_link_libraries(common_test PRIVATE common GTest::gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
 add_executable(tesseract_test ${TESSERACT_SRC_DIR}/tesseract.test.cc)
-target_link_libraries(tesseract_test PRIVATE tesseract_lib simplex GTest::gtest_main)
+target_link_libraries(tesseract_test PRIVATE gari_two_stage_tesseract simplex GTest::gtest_main)
 add_test(NAME tesseract_test COMMAND tesseract_test)
-
