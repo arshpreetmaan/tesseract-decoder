@@ -720,6 +720,76 @@ def get_detector_orderings(gari_structure: dict, det_types: np.ndarray, ordering
     raise ValueError(f"Unknown ordering {ordering_name}")
 
 
+def get_two_stage_layout(gari_structure: dict, dem_file: str) -> dict:
+    """Describes the fixed GARI block layout using full DEM indices."""
+    nx = int(gari_structure["nx_virt"])
+    nz = int(gari_structure["nz_virt"])
+    ny = int(len(gari_structure["i_hy"]))
+    physical_detectors = int(gari_structure["num_original_detectors"])
+    virtual_detectors = nx + nz
+
+    block_counts = {
+        "e_z": nx,
+        "e_x": nz,
+        "e_y": ny,
+        "bar_e_z": nx,
+        "bar_e_x": nz,
+    }
+    error_blocks = {}
+    offset = 0
+    for name, count in block_counts.items():
+        error_blocks[name] = {"offset": offset, "count": count}
+        offset += count
+
+    physical_errors = nx + nz + ny
+    barred_errors = virtual_detectors
+    matrix = gari_structure["gari_matrix"]
+    expected_shape = (physical_detectors + virtual_detectors, offset)
+    if matrix.shape != expected_shape or physical_errors + barred_errors != offset:
+        raise ValueError("GARI matrix dimensions do not agree with its block layout")
+
+    # Physical errors belong entirely to the bottom virtual-detector problem.
+    for error in range(physical_errors):
+        rows = matrix.indices[matrix.indptr[error]:matrix.indptr[error + 1]]
+        if np.any(rows < physical_detectors):
+            raise ValueError(f"physical error {error} touches a physical detector")
+        expected_weight = 1 if error < virtual_detectors else 2
+        if len(rows) != expected_weight:
+            raise ValueError(f"physical error {error} has invalid bottom degree")
+        if error < virtual_detectors and rows.tolist() != [physical_detectors + error]:
+            raise ValueError(f"physical error {error} misses its identity target")
+
+    barred_to_virtual = []
+    for local_index in range(barred_errors):
+        error = physical_errors + local_index
+        detector = physical_detectors + local_index
+        rows = matrix.indices[matrix.indptr[error]:matrix.indptr[error + 1]]
+        virtual_rows = rows[rows >= physical_detectors]
+        if virtual_rows.tolist() != [detector]:
+            raise ValueError(f"barred error {error} has an unexpected virtual target")
+        barred_to_virtual.append({"error": error, "detector": detector})
+
+    return {
+        "schema": "gari_two_stage_layout",
+        "version": 1,
+        "dem_file": dem_file,
+        "top_prior_policy": "modeN",
+        "bottom_prior_policy": "original",
+        "detectors": {
+            "physical": {"offset": 0, "count": physical_detectors},
+            "virtual": {"offset": physical_detectors, "count": virtual_detectors},
+            "total_count": physical_detectors + virtual_detectors,
+        },
+        "errors": {
+            "physical_count": physical_errors,
+            "barred_count": barred_errors,
+            "total_count": offset,
+            "blocks": error_blocks,
+        },
+        "barred_error_to_virtual_detector": barred_to_virtual,
+    }
+
+
 def process_directory(input_path):
     input_path = get_target_path(input_path)
     if os.path.isdir(input_path):
@@ -804,7 +874,10 @@ def process_directory(input_path):
             mapping_dict = {
                 "num_original_detectors": dem.num_detectors,
                 "mapping": mapping,
-                "det_orders": det_orders_clean
+                "det_orders": det_orders_clean,
+                "gari_two_stage": get_two_stage_layout(
+                    gari_structure, f"{stim_stem}_ogL_modeN.dem"
+                ),
             }
             with open(base_path + "_mapping.json", "w") as f:
                 json.dump(mapping_dict, f, indent=2)
