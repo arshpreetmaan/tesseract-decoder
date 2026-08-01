@@ -790,10 +790,12 @@ def get_two_stage_layout(gari_structure: dict, dem_file: str) -> dict:
     }
 
 
-def process_directory(input_path):
+def process_directory(input_path, two_stage_only=False):
     input_path = get_target_path(input_path)
     if os.path.isdir(input_path):
         stim_files = glob.glob(os.path.join(input_path, "**", "*.stim"), recursive=True)
+    elif os.path.isfile(input_path):
+        stim_files = [input_path] if input_path.endswith(".stim") else []
     else:
         if "*" not in input_path:
             input_path += "*"
@@ -832,16 +834,19 @@ def process_directory(input_path):
             #     "modeO", "modeP", "modeQ", "modeR", "modeS", "modeU",
             #     "modeV", "modeS2", "modeSO", "modeSO2"
             # ]
-            modes_to_generate = [
-                "modeA", "modeN",
-                "modeO", "modeQ", "modeR", "modeS", "modeS2", "modeSO", "modeSO2"
+            modes_to_generate = ["modeN"] if two_stage_only else [
+                "modeA", "modeN", "modeO", "modeQ", "modeR", "modeS",
+                "modeS2", "modeSO", "modeSO2"
             ]
             
             for mode_name in modes_to_generate:
                 try:
                     priors_for_mode = assign_prior_weights(gari_structure, mode_name, priors)
-                    dem_for_mode = matrices_to_dem(gari_matrix, gari_obs_matrix, priors_for_mode)
-                    dem_for_mode.to_file(base_path + f"_{mode_name}.dem")
+                    if not two_stage_only:
+                        dem_for_mode = matrices_to_dem(
+                            gari_matrix, gari_obs_matrix, priors_for_mode
+                        )
+                        dem_for_mode.to_file(base_path + f"_{mode_name}.dem")
                     
                     dem_for_mode_og = matrices_to_dem(gari_matrix, gari_obs_matrix_og, priors_for_mode)
                     dem_for_mode_og.to_file(base_path + f"_ogL_{mode_name}.dem")
@@ -859,26 +864,22 @@ def process_directory(input_path):
             for gari_idx, orig_idx in enumerate(z_orig_indices):
                 mapping[int(orig_idx)] = int(nx + gari_idx)
                 
-            orderings = {
-                "order2": get_detector_orderings(gari_structure, det_types, "order2"),
-                "order4": get_detector_orderings(gari_structure, det_types, "order4"),
-                "order7": get_detector_orderings(gari_structure, det_types, "order7"),
-                "order9": get_detector_orderings(gari_structure, det_types, "order9"),
-                "order10": get_detector_orderings(gari_structure, det_types, "order10"),
-            }
-            
-            det_orders_clean = {}
-            for k, v in orderings.items():
-                det_orders_clean[k] = [int(x) for x in v]
-                
             mapping_dict = {
                 "num_original_detectors": dem.num_detectors,
                 "mapping": mapping,
-                "det_orders": det_orders_clean,
                 "gari_two_stage": get_two_stage_layout(
                     gari_structure, f"{stim_stem}_ogL_modeN.dem"
                 ),
             }
+            if not two_stage_only:
+                order_names = ("order2", "order4", "order7", "order9", "order10")
+                mapping_dict["det_orders"] = {
+                    name: [
+                        int(x)
+                        for x in get_detector_orderings(gari_structure, det_types, name)
+                    ]
+                    for name in order_names
+                }
             with open(base_path + "_mapping.json", "w") as f:
                 json.dump(mapping_dict, f, indent=2)
                 
@@ -890,5 +891,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Process stim files and generate Gari DEMs.")
     parser.add_argument("input_path", type=str, help="Input directory, file prefix, or glob pattern for .stim files")
+    parser.add_argument(
+        "--two-stage-only",
+        action="store_true",
+        help="Generate only the mode-N physical-logical DEM and compact two-stage mapping",
+    )
     args = parser.parse_args()
-    process_directory(args.input_path)
+    process_directory(args.input_path, two_stage_only=args.two_stage_only)

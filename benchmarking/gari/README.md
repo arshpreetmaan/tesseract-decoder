@@ -11,18 +11,34 @@
 ## steps before running jobs
 
 ```bash
-bazel build src:tesseract
+bazel build --jobs=1 src:tesseract
 ```
 
-Generate all the gari dems with all prior modes and detector ordering for the targeted circuits.
-From the repository root:
+For two-stage decoding, generate only the required physical-logical mode-N DEM
+and compact mapping JSON. The input can be one `.stim` file or a directory,
+which is scanned recursively:
+
+```bash
+bazel run --jobs=1 //src/py/_tesseract_py_util:gari_dem_utils -- \
+  "testdata/surfacecodes/" --two-stage-only
+```
+
+This writes or updates only `<circuit-directory>/gari/<stem>_ogL_modeN.dem` and
+`<circuit-directory>/gari/<stem>_mapping.json`; existing generated artifacts are
+left untouched. The compact JSON omits the legacy custom detector orders;
+two-stage top orders are generated in memory by Tesseract.
+
+Generate all GARI DEMs with the prior policies and detector orders for the
+targeted circuits. From the repository root:
+
+```bash
 # Run DEM Generation under Bazel:
-bazel run //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/bivariatebicyclecodes/"
-bazel run //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/colorcodes/"
-bazel run //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/surfacecodes/"
+bazel run --jobs=1 //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/bivariatebicyclecodes/"
+bazel run --jobs=1 //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/colorcodes/"
+bazel run --jobs=1 //src/py/_tesseract_py_util:gari_dem_utils -- "testdata/surfacecodes/"
 
 # Run test simulation under Bazel:
-bazel run //src/py:gari_simulation_test
+bazel run --jobs=1 //src/py:gari_simulation_test
 ```
 
 The gari_dem_utils and simulation scripts require `numpy`, `scipy`, `matplotlib`, and `stim`, which are managed by Bazel when run via `bazel run`.
