@@ -16,6 +16,7 @@
 #include <argparse/argparse.hpp>
 #include <atomic>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -23,11 +24,84 @@
 #include <numeric>
 #include <queue>
 #include <thread>
+#include <utility>
 
 #include "common.h"
+#include "gari_two_stage_tesseract.h"
 #include "stim.h"
 #include "tesseract.h"
 #include "utils.h"
+
+namespace {
+
+GariTwoStageLayout parse_gari_two_stage_layout(const nlohmann::json& root,
+                                               const std::string& dem_path) {
+  const auto& layout = root.at("gari_two_stage");
+  if (layout.at("schema") != "gari_two_stage_layout" || layout.at("version") != 1) {
+    throw std::invalid_argument("Unsupported GARI two-stage layout schema");
+  }
+  if (layout.at("top_prior_policy") != "modeN" ||
+      layout.at("bottom_prior_policy") != "original" ||
+      layout.at("dem_file") != std::filesystem::path(dem_path).filename().string()) {
+    throw std::invalid_argument(
+        "GARI two-stage decoding requires the mapped physical-logical mode-N DEM");
+  }
+
+  GariTwoStageLayout result;
+  const auto& detectors = layout.at("detectors");
+  const auto& physical_detectors = detectors.at("physical");
+  const auto& virtual_detectors = detectors.at("virtual");
+  result.physical_detector_count = physical_detectors.at("count").get<size_t>();
+  result.virtual_detector_count = virtual_detectors.at("count").get<size_t>();
+  if (physical_detectors.at("offset") != 0 ||
+      virtual_detectors.at("offset") != result.physical_detector_count ||
+      detectors.at("total_count") !=
+          result.physical_detector_count + result.virtual_detector_count) {
+    throw std::invalid_argument("GARI detector blocks are not contiguous");
+  }
+
+  const auto& errors = layout.at("errors");
+  const auto& blocks = errors.at("blocks");
+  size_t error_offset = 0;
+  auto read_block = [&](const char* name) {
+    const auto& block = blocks.at(name);
+    if (block.at("offset") != error_offset) {
+      throw std::invalid_argument("GARI error blocks are not contiguous");
+    }
+    size_t count = block.at("count").get<size_t>();
+    error_offset += count;
+    return count;
+  };
+  size_t e_z_count = read_block("e_z");
+  size_t e_x_count = read_block("e_x");
+  size_t e_y_count = read_block("e_y");
+  size_t bar_e_z_count = read_block("bar_e_z");
+  size_t bar_e_x_count = read_block("bar_e_x");
+  result.physical_error_count = e_z_count + e_x_count + e_y_count;
+  result.barred_error_count = bar_e_z_count + bar_e_x_count;
+  if (bar_e_z_count != e_z_count || bar_e_x_count != e_x_count ||
+      errors.at("physical_count") != result.physical_error_count ||
+      errors.at("barred_count") != result.barred_error_count ||
+      errors.at("total_count") != error_offset) {
+    throw std::invalid_argument("GARI error counts do not agree with the block layout");
+  }
+
+  const auto& mappings = layout.at("barred_error_to_virtual_detector");
+  if (mappings.size() != result.barred_error_count) {
+    throw std::invalid_argument("GARI barred-error mapping has the wrong size");
+  }
+  result.barred_error_to_virtual_detector.reserve(mappings.size());
+  for (size_t k = 0; k < mappings.size(); ++k) {
+    if (mappings[k].at("error") != result.physical_error_count + k) {
+      throw std::invalid_argument("GARI barred-error mapping is not in error order");
+    }
+    result.barred_error_to_virtual_detector.push_back(
+        mappings[k].at("detector").get<size_t>());
+  }
+  return result;
+}
+
+}  // namespace
 
 struct Args {
   std::string circuit_path;
@@ -35,6 +109,10 @@ struct Args {
   bool no_merge_errors = false;
   std::string det_mapping_file;
   std::string custom_order;
+  bool gari_two_stage = false;
+  size_t gari_bottom_beam = 2;
+  GariTwoStageLayout gari_two_stage_layout;
+  std::vector<size_t> gari_source_to_top_detector;
 
   // Manifold orientation options
   uint64_t det_order_seed;
@@ -95,6 +173,12 @@ struct Args {
     return append_observables || !obs_in_fname.empty() || (sample_num_shots > 0);
   }
 
+  DetOrder detector_order_method() const {
+    if (det_order_bfs) return DetOrder::DetBFS;
+    if (det_order_coordinate) return DetOrder::DetCoordinate;
+    return DetOrder::DetIndex;
+  }
+
   void validate(const argparse::ArgumentParser& program) {
     if (circuit_path.empty() and dem_path.empty()) {
       throw std::invalid_argument("Must provide at least one of --circuit or --dem");
@@ -152,6 +236,32 @@ struct Args {
       throw std::invalid_argument("Beam climbing requires a finite beam");
     }
 
+    if (gari_two_stage) {
+      if (dem_path.empty() || det_mapping_file.empty()) {
+        throw std::invalid_argument(
+            "--gari-two-stage requires --dem and --det-mapping-file");
+      }
+      if (!custom_order.empty() || det_order_coordinate || beam_climbing || no_revisit_dets ||
+          sparsify_errors || det_penalty != 0 || !dem_out_fname.empty()) {
+        throw std::invalid_argument(
+            "GARI two-stage decoding does not use custom/coordinate orders, internal beam "
+            "climbing, no-revisit, detector penalties, sparsification, or --dem-out");
+      }
+      if (!program.is_used("--beam")) {
+        det_beam = 20;
+      }
+      if (det_beam >= INF_DET_BEAM || gari_bottom_beam >= INF_DET_BEAM) {
+        throw std::invalid_argument(
+            "GARI two-stage top and bottom beams must be below the infinity sentinel");
+      }
+      if (!program.is_used("--num-det-orders")) {
+        num_det_orders = 21;
+      }
+      if (num_det_orders == 0) {
+        throw std::invalid_argument("--num-det-orders must be at least 1");
+      }
+    }
+
     bool has_base = program.is_used("--sparsify-base-degree");
     bool has_max = program.is_used("--sparsify-max-degree");
     bool has_limit = program.is_used("--sparsify-reactivate-limit");
@@ -192,6 +302,25 @@ struct Args {
       nlohmann::json j = nlohmann::json::parse(f);
       num_original_detectors = j.at("num_original_detectors").get<uint64_t>();
       det_mapping = j.at("mapping").get<std::vector<uint64_t>>();
+      if (gari_two_stage) {
+        gari_two_stage_layout = parse_gari_two_stage_layout(j, dem_path);
+        if (gari_two_stage_layout.physical_detector_count != num_original_detectors) {
+          throw std::invalid_argument(
+              "GARI two-stage layout disagrees with the source detector count");
+        }
+        if (det_mapping.size() != num_original_detectors) {
+          throw std::invalid_argument("GARI source-detector mapping has the wrong size");
+        }
+        std::vector<bool> seen(num_original_detectors);
+        for (size_t detector : det_mapping) {
+          if (detector >= num_original_detectors || seen[detector]) {
+            throw std::invalid_argument(
+                "GARI source-detector mapping must be a permutation of physical detectors");
+          }
+          seen[detector] = true;
+        }
+        gari_source_to_top_detector.assign(det_mapping.begin(), det_mapping.end());
+      }
       
       if (!custom_order.empty() && j.contains("det_orders")) {
         if (custom_order == "all") {
@@ -219,6 +348,10 @@ struct Args {
       }
       circuit = stim::Circuit::from_file(file);
       fclose(file);
+      if (!det_mapping.empty() && circuit.count_detectors() != det_mapping.size()) {
+        throw std::invalid_argument(
+            "Circuit detector count does not match the detector mapping");
+      }
     }
 
     // Get a DEM, preferring to use the specified one and falling back to
@@ -256,7 +389,9 @@ struct Args {
           std::cout << ")" << std::endl;
         }
       }
-      if (!custom_det_orders.empty()) {
+      if (gari_two_stage) {
+        config.det_orders.clear();
+      } else if (!custom_det_orders.empty()) {
         for (const auto& order : custom_det_orders) {
           if (order.size() != config.dem.count_detectors()) {
             throw std::invalid_argument("Custom detector order size does not match DEM detector count.");
@@ -265,15 +400,8 @@ struct Args {
         config.det_orders = custom_det_orders;
         num_det_orders = custom_det_orders.size();
       } else {
-        DetOrder order = DetOrder::DetIndex;
-        if (det_order_bfs) {
-          order = DetOrder::DetBFS;
-        } else if (det_order_index) {
-          order = DetOrder::DetIndex;
-        } else if (det_order_coordinate) {
-          order = DetOrder::DetCoordinate;
-        }
-        config.det_orders = build_det_orders(config.dem, num_det_orders, order, det_order_seed);
+        config.det_orders =
+            build_det_orders(config.dem, num_det_orders, detector_order_method(), det_order_seed);
       }
     }
 
@@ -395,6 +523,15 @@ int main(int argc, char* argv[]) {
   program.add_argument("--dem").help("Stim dem file path").store_into(args.dem_path);
   program.add_argument("--det-mapping-file").help("JSON file containing detector mapping").default_value(std::string("")).store_into(args.det_mapping_file);
   program.add_argument("--custom-order").help("Specific detector order to use from mapping JSON (e.g. 'order5' or 'all')").default_value(std::string("")).store_into(args.custom_order);
+  program.add_argument("--gari-two-stage")
+      .help("Split a monolithic GARI physical-logical mode-N DEM in memory")
+      .flag()
+      .store_into(args.gari_two_stage);
+  program.add_argument("--gari-bottom-beam")
+      .help("Fixed detector beam for each bottom GARI completion")
+      .metavar("N")
+      .default_value(size_t(2))
+      .store_into(args.gari_bottom_beam);
   program.add_argument("--no-merge-errors")
       .help("If provided, will not merge identical error mechanisms.")
       .store_into(args.no_merge_errors);
@@ -590,56 +727,106 @@ int main(int argc, char* argv[]) {
     std::cerr << program;
     return EXIT_FAILURE;
   }
-  args.validate(program);
   TesseractConfig config;
   std::vector<stim::SparseShot> shots;
   std::unique_ptr<stim::MeasureRecordWriter> writer;
-  args.extract(config, shots, writer);
-  std::vector<uint64_t> obs_predicted(shots.size());
+  try {
+    args.validate(program);
+    args.extract(config, shots, writer);
+  } catch (const std::exception& err) {
+    std::cerr << err.what() << std::endl;
+    return EXIT_FAILURE;
+  }
+  size_t num_observables = config.dem.count_observables();
+  std::vector<stim::simd_bits<64>> obs_predicted(shots.size(),
+                                                 stim::simd_bits<64>(num_observables));
   std::vector<double> cost_predicted(shots.size());
   std::vector<double> decoding_time_seconds(shots.size());
   std::vector<std::atomic<bool>> low_confidence(shots.size());
   const stim::DetectorErrorModel original_dem = config.dem.flattened();
   std::vector<std::unique_ptr<TesseractDecoder>> decoders(args.num_threads);
+  std::vector<std::unique_ptr<GariTwoStageTesseractDecoder>> gari_decoders(args.num_threads);
+  std::vector<GariTwoStageDecodeResult> gari_results(
+      args.gari_two_stage && !args.stats_out_fname.empty() ? shots.size() : 0);
+  GariTwoStageConfig gari_config;
+  auto decoder_setup_start = std::chrono::high_resolution_clock::now();
+  try {
+    if (args.gari_two_stage) {
+      gari_config.layout = args.gari_two_stage_layout;
+      gari_config.max_top_beam = args.det_beam;
+      gari_config.num_top_detector_orders = args.num_det_orders;
+      gari_config.top_detector_order_method = args.detector_order_method();
+      gari_config.top_detector_order_seed = args.det_order_seed;
+      gari_config.bottom_beam = args.gari_bottom_beam;
+      gari_config.pqlimit = args.pqlimit;
+      gari_config.verbose = args.verbose;
+      gari_config.source_to_top_detector = args.gari_source_to_top_detector;
+      for (auto& decoder : gari_decoders) {
+        decoder = std::make_unique<GariTwoStageTesseractDecoder>(original_dem, gari_config);
+      }
+    } else {
+      for (auto& decoder : decoders) {
+        decoder = std::make_unique<TesseractDecoder>(config);
+      }
+    }
+  } catch (const std::exception& err) {
+    std::cerr << err.what() << std::endl;
+    return EXIT_FAILURE;
+  }
+  double decoder_setup_time_seconds =
+      std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - decoder_setup_start)
+          .count();
+  size_t error_use_count = args.gari_two_stage ? 0 : original_dem.count_errors();
   std::vector<std::vector<size_t>> error_use_per_thread(
-      args.num_threads, std::vector<size_t>(original_dem.count_errors()));
+      args.num_threads, std::vector<size_t>(error_use_count));
   bool has_obs = args.has_observables();
   size_t num_errors = 0;
   size_t num_low_confidence = 0;
-  double total_time_seconds = 0;
-  size_t num_observables = config.dem.count_observables();
+  double total_time_seconds = decoder_setup_time_seconds;
   size_t shot = parallel_for_shots_in_order(
       shots.size(), args.num_threads,
       [&](size_t thread_index, size_t shot_index) {
-        if (!decoders[thread_index]) {
-          decoders[thread_index] = std::make_unique<TesseractDecoder>(config);
-        }
-        auto& decoder = *decoders[thread_index];
-        auto& error_use = error_use_per_thread[thread_index];
         auto start_time = std::chrono::high_resolution_clock::now();
-        decoder.decode_to_errors(shots[shot_index].hits);
+        if (args.gari_two_stage) {
+          auto result = gari_decoders[thread_index]->decode(shots[shot_index].hits);
+          obs_predicted[shot_index].clear();
+          for (int observable : result.observables) {
+            obs_predicted[shot_index][observable] ^= 1;
+          }
+          low_confidence[shot_index] = !result.completed;
+          cost_predicted[shot_index] = result.physical_cost;
+          if (!args.stats_out_fname.empty()) {
+            gari_results[shot_index] = std::move(result);
+          }
+        } else {
+          auto& decoder = *decoders[thread_index];
+          auto& error_use = error_use_per_thread[thread_index];
+          decoder.decode_to_errors(shots[shot_index].hits);
+          obs_predicted[shot_index].clear();
+          for (int observable : decoder.get_flipped_observables(decoder.predicted_errors_buffer)) {
+            obs_predicted[shot_index][observable] ^= 1;
+          }
+          low_confidence[shot_index] = decoder.low_confidence_flag;
+          cost_predicted[shot_index] = decoder.cost_from_errors(decoder.predicted_errors_buffer);
+          if (!has_obs || shots[shot_index].obs_mask == obs_predicted[shot_index]) {
+            for (size_t ei : decoder.predicted_errors_buffer) {
+              ++error_use[ei];
+            }
+          }
+        }
         auto stop_time = std::chrono::high_resolution_clock::now();
         decoding_time_seconds[shot_index] =
             std::chrono::duration_cast<std::chrono::microseconds>(stop_time - start_time).count() /
             1e6;
-        obs_predicted[shot_index] =
-            vector_to_u64_mask(decoder.get_flipped_observables(decoder.predicted_errors_buffer));
-        low_confidence[shot_index] = decoder.low_confidence_flag;
-        cost_predicted[shot_index] = decoder.cost_from_errors(decoder.predicted_errors_buffer);
-        if (!has_obs or shots[shot_index].obs_mask_as_u64() == obs_predicted[shot_index]) {
-          for (size_t ei : decoder.predicted_errors_buffer) {
-            ++error_use[ei];
-          }
-        }
       },
       [&](size_t shot_index) {
         if (writer) {
-          writer->write_bits((uint8_t*)&obs_predicted[shot_index], num_observables);
+          writer->write_bits(obs_predicted[shot_index].u8, num_observables);
           writer->write_end();
         }
         if (low_confidence[shot_index]) {
           ++num_low_confidence;
-        } else if (obs_predicted[shot_index] != shots[shot_index].obs_mask_as_u64()) {
+        } else if (has_obs && obs_predicted[shot_index] != shots[shot_index].obs_mask) {
           ++num_errors;
         }
         total_time_seconds += decoding_time_seconds[shot_index];
@@ -654,7 +841,7 @@ int main(int argc, char* argv[]) {
         return num_errors < args.max_errors;
       });
 
-  std::vector<size_t> error_use_totals(original_dem.count_errors());
+  std::vector<size_t> error_use_totals(error_use_count);
   for (const auto& error_use : error_use_per_thread) {
     for (size_t ei = 0; ei < error_use_totals.size(); ++ei) {
       error_use_totals[ei] += error_use[ei];
@@ -710,6 +897,7 @@ int main(int argc, char* argv[]) {
         {"pqlimit", args.pqlimit},
         {"num_det_orders", args.num_det_orders},
         {"det_order_seed", args.det_order_seed},
+        {"decoder_setup_time_seconds", decoder_setup_time_seconds},
         {"total_time_seconds", total_time_seconds},
         {"num_errors", num_errors},
         {"num_low_confidence", num_low_confidence},
@@ -720,6 +908,67 @@ int main(int argc, char* argv[]) {
         {"sparsify_base_degree", args.sparsify_base_degree},
         {"sparsify_max_degree", args.sparsify_max_degree},
         {"sparsify_reactivate_limit", effective_sparsify_reactivate_limit}};
+
+    if (args.gari_two_stage) {
+      size_t top_completions = 0;
+      size_t bottom_completions = 0;
+      size_t unique_debts = 0;
+      size_t bottom_cache_hits = 0;
+      size_t top_queue_pushes = 0;
+      size_t bottom_queue_pushes = 0;
+      double top_runtime_seconds = 0;
+      double bottom_runtime_seconds = 0;
+      nlohmann::json shot_stats = nlohmann::json::array();
+      for (size_t k = 0; k < shot; ++k) {
+        const auto& result = gari_results[k];
+        nlohmann::json winner = nullptr;
+        nlohmann::json physical_cost = nullptr;
+        if (result.completed) {
+          winner = {{"trial", result.winner_trial},
+                    {"top_detector_order", result.winner_top_detector_order},
+                    {"top_beam", result.winner_top_beam}};
+          physical_cost = result.physical_cost;
+        }
+        shot_stats.push_back({
+            {"completed", result.completed},
+            {"physical_cost", physical_cost},
+            {"observables", result.observables},
+            {"winner", winner},
+            {"top_completions", result.top_completions},
+            {"bottom_completions", result.bottom_completions},
+            {"unique_debts", result.unique_debts},
+            {"bottom_cache_hits", result.bottom_cache_hits},
+            {"top_runtime_seconds", result.top_runtime_seconds},
+            {"bottom_runtime_seconds", result.bottom_runtime_seconds},
+            {"top_queue_pushes", result.top_queue_pushes},
+            {"bottom_queue_pushes", result.bottom_queue_pushes},
+        });
+        top_completions += result.top_completions;
+        bottom_completions += result.bottom_completions;
+        unique_debts += result.unique_debts;
+        bottom_cache_hits += result.bottom_cache_hits;
+        top_runtime_seconds += result.top_runtime_seconds;
+        bottom_runtime_seconds += result.bottom_runtime_seconds;
+        top_queue_pushes += result.top_queue_pushes;
+        bottom_queue_pushes += result.bottom_queue_pushes;
+      }
+      stats_json["gari_two_stage"] = {
+          {"max_top_beam", args.det_beam},
+          {"num_top_detector_orders", args.num_det_orders},
+          {"top_detector_order_method",
+           args.det_order_bfs ? "bfs" : (args.det_order_coordinate ? "coordinate" : "index")},
+          {"bottom_beam", args.gari_bottom_beam},
+          {"top_completions", top_completions},
+          {"bottom_completions", bottom_completions},
+          {"total_unique_debts_across_shots", unique_debts},
+          {"bottom_cache_hits", bottom_cache_hits},
+          {"top_runtime_seconds", top_runtime_seconds},
+          {"bottom_runtime_seconds", bottom_runtime_seconds},
+          {"top_queue_pushes", top_queue_pushes},
+          {"bottom_queue_pushes", bottom_queue_pushes},
+          {"shots", std::move(shot_stats)},
+      };
+    }
 
     if (args.stats_out_fname == "-") {
       std::cout << stats_json << std::endl;
