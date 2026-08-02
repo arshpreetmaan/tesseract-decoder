@@ -63,6 +63,14 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   EXPECT_NEAR(result.physical_cost, -std::log(0.05 / 0.95), EPSILON);
   EXPECT_EQ(result.unique_debts, 1);
   EXPECT_EQ(result.bottom_cache_hits, 1);
+
+  config.max_top_beam = 3;
+  config.top_beam_climbing = true;
+  GariTwoStageTesseractDecoder climbing_decoder(dem, config);
+  auto climbing_result = climbing_decoder.decode({0, 1});
+  EXPECT_TRUE(climbing_result.completed);
+  EXPECT_EQ(climbing_result.unique_debts, 1);
+  EXPECT_EQ(climbing_result.bottom_cache_hits, 3);
 }
 
 bool simplex_test_compare(stim::DetectorErrorModel& dem, std::vector<stim::SparseShot>& shots) {

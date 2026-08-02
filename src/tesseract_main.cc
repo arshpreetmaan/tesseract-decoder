@@ -260,9 +260,6 @@ struct Args {
       if (num_det_orders == 0) {
         throw std::invalid_argument("--num-det-orders must be at least 1");
       }
-      // The two-stage outer loop is the beam-climbing loop. Child decoders keep
-      // their internal beam climbing disabled.
-      beam_climbing = true;
     }
 
     bool has_base = program.is_used("--sparsify-base-degree");
@@ -527,7 +524,7 @@ int main(int argc, char* argv[]) {
   program.add_argument("--det-mapping-file").help("JSON file containing detector mapping").default_value(std::string("")).store_into(args.det_mapping_file);
   program.add_argument("--custom-order").help("Specific detector order to use from mapping JSON (e.g. 'order5' or 'all')").default_value(std::string("")).store_into(args.custom_order);
   program.add_argument("--gari-two-stage")
-      .help("Split a GARI physical-logical mode-N DEM and use outer beam climbing")
+      .help("Split a GARI physical-logical mode-N DEM into top and bottom decoders")
       .flag()
       .store_into(args.gari_two_stage);
   program.add_argument("--gari-bottom-beam")
@@ -759,6 +756,7 @@ int main(int argc, char* argv[]) {
     if (args.gari_two_stage) {
       gari_config.layout = args.gari_two_stage_layout;
       gari_config.max_top_beam = args.det_beam;
+      gari_config.top_beam_climbing = args.beam_climbing;
       gari_config.num_top_detector_orders = args.num_det_orders;
       gari_config.top_detector_order_method = args.detector_order_method();
       gari_config.top_detector_order_seed = args.det_order_seed;

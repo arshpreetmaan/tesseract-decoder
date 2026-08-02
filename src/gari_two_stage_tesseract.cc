@@ -305,8 +305,14 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
   GariTwoStageDecodeResult result;
   std::unordered_map<std::vector<uint64_t>, BottomOutcome, VectorHash> bottom_cache;
 
-  for (size_t trial = 0; trial <= config_.max_top_beam; ++trial) {
-    const size_t top_beam = trial;
+  const size_t top_trial_count = config_.top_beam_climbing
+                                     ? std::max(config_.max_top_beam + 1,
+                                                config_.num_top_detector_orders)
+                                     : config_.num_top_detector_orders;
+  for (size_t trial = 0; trial < top_trial_count; ++trial) {
+    const size_t top_beam = config_.top_beam_climbing
+                                ? trial % (config_.max_top_beam + 1)
+                                : config_.max_top_beam;
     const size_t top_detector_order = trial % config_.num_top_detector_orders;
 
     top_decoder_->decode_to_errors(top_detections, top_detector_order, top_beam);

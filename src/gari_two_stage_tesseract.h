@@ -25,6 +25,7 @@ struct GariTwoStageLayout {
 struct GariTwoStageConfig {
   GariTwoStageLayout layout;
   size_t max_top_beam = 20;
+  bool top_beam_climbing = false;
   size_t num_top_detector_orders = 21;
   DetOrder top_detector_order_method = DetOrder::DetIndex;
   uint64_t top_detector_order_seed = 0;
