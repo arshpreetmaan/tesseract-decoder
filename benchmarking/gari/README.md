@@ -24,9 +24,26 @@ bazel run --jobs=1 //src/py/_tesseract_py_util:gari_dem_utils -- \
 ```
 
 This writes or updates only `<circuit-directory>/gari/<stem>_ogL_modeN.dem` and
-`<circuit-directory>/gari/<stem>_mapping.json`; existing generated artifacts are
-left untouched. The compact JSON omits the legacy custom detector orders;
-two-stage top orders are generated in memory by Tesseract.
+`<circuit-directory>/gari/<stem>_two_stage_mapping.json`; existing generated
+artifacts are left untouched. The compact JSON omits the legacy custom detector
+orders; two-stage top orders are generated in memory by Tesseract.
+
+A fixed beam with one top order performs one top-and-bottom pass:
+
+```bash
+./bazel-bin/src/tesseract \
+  --gari-two-stage --circuit "<circuit>.stim" \
+  --dem "<gari>/<stem>_ogL_modeN.dem" \
+  --det-mapping-file "<gari>/<stem>_two_stage_mapping.json" \
+  --sample-num-shots 10 --sample-seed 0 --threads 1 \
+  --beam 20 --num-det-orders 1 --det-order-index \
+  --gari-bottom-beam 2 --pqlimit 1000000 \
+  --stats-out "<fixed-stats>.json"
+```
+
+Add `--beam-climbing` to test beams 0 through 20. Set
+`--num-det-orders 21` to cycle through 21 randomized top index orders during
+that outer schedule.
 
 Generate all GARI DEMs with the prior policies and detector orders for the
 targeted circuits. From the repository root:

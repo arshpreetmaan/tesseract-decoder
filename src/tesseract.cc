@@ -666,6 +666,11 @@ void TesseractDecoder::decode_shots(std::vector<stim::SparseShot>& shots,
 }
 
 void TesseractDecoder::build_sparse_d2e(const std::vector<uint64_t>& detections) {
+  if (sparse_d2e_valid && sparse_d2e_reactivate_limit == config.sparsify_reactivate_limit &&
+      sparse_d2e_detections == detections) {
+    return;
+  }
+
   std::vector<uint8_t> shot_dets(num_detectors, 0);
   for (uint64_t d : detections) {
     if (d < num_detectors) {
@@ -729,4 +734,7 @@ void TesseractDecoder::build_sparse_d2e(const std::vector<uint64_t>& detections)
       }
     }
   }
+  sparse_d2e_detections = detections;
+  sparse_d2e_reactivate_limit = config.sparsify_reactivate_limit;
+  sparse_d2e_valid = true;
 }

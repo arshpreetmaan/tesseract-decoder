@@ -138,6 +138,10 @@ struct TesseractDecoder {
                                        const std::vector<std::vector<int>>& active_d2e) const;
 
  private:
+  std::vector<uint64_t> sparse_d2e_detections;
+  int sparse_d2e_reactivate_limit = -1;
+  bool sparse_d2e_valid = false;
+
   void build_sparse_d2e(const std::vector<uint64_t>& detections);
   void decode_to_errors_with_graph(const std::vector<uint64_t>& detections, size_t detector_order,
                                    size_t detector_beam,

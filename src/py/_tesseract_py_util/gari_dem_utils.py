@@ -880,7 +880,8 @@ def process_directory(input_path, two_stage_only=False):
                     ]
                     for name in order_names
                 }
-            with open(base_path + "_mapping.json", "w") as f:
+            mapping_suffix = "_two_stage_mapping.json" if two_stage_only else "_mapping.json"
+            with open(base_path + mapping_suffix, "w") as f:
                 json.dump(mapping_dict, f, indent=2)
                 
             print(f"Successfully processed {stim_path}")

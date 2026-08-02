@@ -32,8 +32,13 @@ struct GariTwoStageConfig {
   bool top_no_revisit_dets = false;
   size_t bottom_beam = 2;
   size_t pqlimit = DEFAULT_PQLIMIT;
-  double det_penalty = 0;
+  double top_det_penalty = 0;
+  bool top_sparsify_errors = false;
+  int top_sparsify_base_degree = -1;
+  int top_sparsify_max_degree = -1;
+  int top_sparsify_reactivate_limit = -1;
   bool verbose = false;
+  std::vector<std::vector<size_t>> top_detector_orders;
   // Source detector index -> top GARI detector index. DetIndex orders follow
   // this source chronology instead of the block-grouped GARI row order.
   std::vector<size_t> source_to_top_detector;
@@ -72,6 +77,9 @@ class GariTwoStageTesseractDecoder {
   }
   bool bottom_no_revisit_dets_enabled() const {
     return bottom_decoder_->config.no_revisit_dets;
+  }
+  int top_sparsify_reactivate_limit() const {
+    return top_decoder_->config.sparsify_reactivate_limit;
   }
 
  private:

@@ -101,6 +101,60 @@ GariTwoStageLayout parse_gari_two_stage_layout(const nlohmann::json& root,
   return result;
 }
 
+std::vector<std::vector<size_t>> map_source_orders_to_top(
+    const std::vector<std::vector<size_t>>& source_orders,
+    const std::vector<uint64_t>& source_to_top) {
+  std::vector<std::vector<size_t>> result;
+  result.reserve(source_orders.size());
+  for (const auto& source_order : source_orders) {
+    if (source_order.size() != source_to_top.size()) {
+      throw std::invalid_argument("Source detector order has the wrong size");
+    }
+    std::vector<bool> seen(source_to_top.size());
+    std::vector<size_t> top_order;
+    top_order.reserve(source_order.size());
+    for (size_t source_detector : source_order) {
+      if (source_detector >= source_to_top.size() || seen[source_detector]) {
+        throw std::invalid_argument("Source detector order must be a permutation");
+      }
+      seen[source_detector] = true;
+      top_order.push_back(source_to_top[source_detector]);
+    }
+    result.push_back(std::move(top_order));
+  }
+  return result;
+}
+
+std::vector<std::vector<size_t>> filter_custom_orders_to_top(
+    const std::vector<std::vector<size_t>>& gari_orders, size_t physical_detectors,
+    size_t total_detectors) {
+  std::vector<std::vector<size_t>> result;
+  for (const auto& gari_order : gari_orders) {
+    if (gari_order.size() != total_detectors) {
+      throw std::invalid_argument("Custom GARI detector order has the wrong size");
+    }
+    std::vector<bool> seen(total_detectors);
+    std::vector<size_t> top_order;
+    top_order.reserve(physical_detectors);
+    for (size_t detector : gari_order) {
+      if (detector >= total_detectors || seen[detector]) {
+        throw std::invalid_argument("Custom GARI detector order must be a permutation");
+      }
+      seen[detector] = true;
+      if (detector < physical_detectors) {
+        top_order.push_back(detector);
+      }
+    }
+    if (top_order.size() != physical_detectors) {
+      throw std::invalid_argument("Custom GARI detector order omits a top detector");
+    }
+    if (std::find(result.begin(), result.end(), top_order) == result.end()) {
+      result.push_back(std::move(top_order));
+    }
+  }
+  return result;
+}
+
 }  // namespace
 
 struct Args {
@@ -113,6 +167,7 @@ struct Args {
   size_t gari_bottom_beam = 2;
   GariTwoStageLayout gari_two_stage_layout;
   std::vector<size_t> gari_source_to_top_detector;
+  std::vector<std::vector<size_t>> gari_top_detector_orders;
 
   // Manifold orientation options
   uint64_t det_order_seed;
@@ -241,12 +296,6 @@ struct Args {
         throw std::invalid_argument(
             "--gari-two-stage requires --dem and --det-mapping-file");
       }
-      if (!custom_order.empty() || det_order_coordinate || sparsify_errors || det_penalty != 0 ||
-          !dem_out_fname.empty()) {
-        throw std::invalid_argument(
-            "GARI two-stage decoding does not use custom/coordinate orders, detector penalties, "
-            "sparsification, or --dem-out");
-      }
       if (!program.is_used("--beam")) {
         det_beam = 20;
       }
@@ -283,7 +332,10 @@ struct Args {
       if (has_limit && sparsify_reactivate_limit < -1) {
         throw std::invalid_argument("--sparsify-reactivate-limit must be >= -1.");
       }
-      if (has_max && sparsify_max_degree < sparsify_base_degree) {
+      if (has_max && sparsify_max_degree < -1) {
+        throw std::invalid_argument("--sparsify-max-degree must be >= -1.");
+      }
+      if (sparsify_max_degree >= 0 && sparsify_max_degree < sparsify_base_degree) {
         throw std::invalid_argument("--sparsify-max-degree must be >= --sparsify-base-degree.");
       }
     }
@@ -334,6 +386,9 @@ struct Args {
             throw std::invalid_argument("Mapping file does not contain custom order: " + custom_order);
           }
         }
+      } else if (!custom_order.empty() && gari_two_stage) {
+        throw std::invalid_argument(
+            "--custom-order requires a mapping JSON containing det_orders");
       }
     } else if (!custom_order.empty()) {
       throw std::invalid_argument("--custom-order requires a --det-mapping-file containing the orders.");
@@ -354,6 +409,15 @@ struct Args {
       }
     }
 
+    auto make_source_dem = [&]() {
+      return stim::ErrorAnalyzer::circuit_to_detector_error_model(
+          circuit, /*decompose_errors=*/false, /*fold_loops=*/true,
+          /*allow_gauge_detectors=*/true,
+          /*approximate_disjoint_errors_threshold=*/1,
+          /*ignore_decomposition_failures=*/false,
+          /*block_decomposition_from_introducing_remnant_edges=*/false);
+    };
+
     // Get a DEM, preferring to use the specified one and falling back to
     // generating one from the circuit
     if (!dem_path.empty()) {
@@ -365,12 +429,7 @@ struct Args {
       fclose(file);
     } else {
       assert(!circuit_path.empty());
-      config.dem = stim::ErrorAnalyzer::circuit_to_detector_error_model(
-          circuit, /*decompose_errors=*/false, /*fold_loops=*/true,
-          /*allow_gauge_detectors=*/true,
-          /*approximate_disjoint_errors_threshold=*/1,
-          /*ignore_decomposition_failures=*/false,
-          /*block_decomposition_from_introducing_remnant_edges=*/false);
+      config.dem = make_source_dem();
     }
 
     config.merge_errors = !no_merge_errors;
@@ -390,6 +449,21 @@ struct Args {
         }
       }
       if (gari_two_stage) {
+        if (!custom_det_orders.empty()) {
+          gari_top_detector_orders = filter_custom_orders_to_top(
+              custom_det_orders, gari_two_stage_layout.physical_detector_count,
+              gari_two_stage_layout.physical_detector_count +
+                  gari_two_stage_layout.virtual_detector_count);
+          num_det_orders = gari_top_detector_orders.size();
+        } else if (detector_order_method() != DetOrder::DetIndex) {
+          if (circuit_path.empty()) {
+            throw std::invalid_argument(
+                "GARI BFS/coordinate detector orders require --circuit");
+          }
+          auto source_orders = build_det_orders(make_source_dem(), num_det_orders,
+                                                detector_order_method(), det_order_seed);
+          gari_top_detector_orders = map_source_orders_to_top(source_orders, det_mapping);
+        }
         config.det_orders.clear();
       } else if (!custom_det_orders.empty()) {
         for (const auto& order : custom_det_orders) {
@@ -522,7 +596,12 @@ int main(int argc, char* argv[]) {
   program.add_argument("--circuit").help("Stim circuit file path").store_into(args.circuit_path);
   program.add_argument("--dem").help("Stim dem file path").store_into(args.dem_path);
   program.add_argument("--det-mapping-file").help("JSON file containing detector mapping").default_value(std::string("")).store_into(args.det_mapping_file);
-  program.add_argument("--custom-order").help("Specific detector order to use from mapping JSON (e.g. 'order5' or 'all')").default_value(std::string("")).store_into(args.custom_order);
+  program.add_argument("--custom-order")
+      .help(
+          "Specific detector order from a full mapping JSON (for example, 'order5' or 'all'); "
+          "two-stage mode filters it to the top")
+      .default_value(std::string(""))
+      .store_into(args.custom_order);
   program.add_argument("--gari-two-stage")
       .help("Split a GARI physical-logical mode-N DEM into top and bottom decoders")
       .flag()
@@ -533,15 +612,16 @@ int main(int argc, char* argv[]) {
       .default_value(size_t(2))
       .store_into(args.gari_bottom_beam);
   program.add_argument("--no-merge-errors")
-      .help("If provided, will not merge identical error mechanisms.")
+      .help(
+          "If provided, will not merge identical error mechanisms (two-stage children never merge)")
       .store_into(args.no_merge_errors);
   program.add_argument("--num-det-orders")
-      .help("Number of ways to orient the manifold when reordering the detectors")
+      .help("Number of detector orders (top detector orders in GARI two-stage mode)")
       .metavar("N")
       .default_value(size_t(1))
       .store_into(args.num_det_orders);
   program.add_argument("--det-order-bfs")
-      .help("Use BFS-based detector ordering")
+      .help("Use BFS-based detector ordering (mapped from the source circuit in two-stage mode)")
       .flag()
       .store_into(args.det_order_bfs);
   program.add_argument("--det-order-index")
@@ -551,7 +631,9 @@ int main(int argc, char* argv[]) {
       .flag()
       .store_into(args.det_order_index);
   program.add_argument("--det-order-coordinate")
-      .help("Random geometric detector orientation ordering")
+      .help(
+          "Random geometric detector orientation ordering (mapped from the source circuit in "
+          "two-stage mode)")
       .flag()
       .store_into(args.det_order_coordinate);
   program.add_argument("--det-order-seed")
@@ -644,7 +726,7 @@ int main(int argc, char* argv[]) {
       .default_value(std::string(""))
       .store_into(args.out_format);
   program.add_argument("--dem-out")
-      .help("File to write matching frequency dem to")
+      .help("File to write error-use frequency DEM to (full retained GARI candidate in two-stage mode)")
       .metavar("filename")
       .default_value(std::string(""))
       .store_into(args.dem_out_fname);
@@ -660,19 +742,20 @@ int main(int argc, char* argv[]) {
           std::thread::hardware_concurrency() == 0 ? 1 : std::thread::hardware_concurrency()))
       .store_into(args.num_threads);
   program.add_argument("--beam")
-      .help("Beam to use for truncation (default = infinity)")
+      .help(
+          "Fixed beam, or maximum beam with climbing (default infinity; two-stage default 20)")
       .metavar("N")
       .default_value(INF_DET_BEAM)
       .store_into(args.det_beam);
   program.add_argument("--det-penalty")
       .help(
           "Penalty cost to add per activated detector in the residual "
-          "syndrome.")
+          "syndrome (top child only in GARI two-stage mode).")
       .metavar("D")
       .default_value(0.0)
       .store_into(args.det_penalty);
   program.add_argument("--beam-climbing")
-      .help("Use beam-climbing heuristic")
+      .help("Use beam climbing (controls the outer top schedule in GARI two-stage mode)")
       .flag()
       .store_into(args.beam_climbing);
   program.add_argument("--no-revisit-dets")
@@ -682,7 +765,9 @@ int main(int argc, char* argv[]) {
       .store_into(args.no_revisit_dets);
 
   program.add_argument("--pqlimit")
-      .help("Maximum size of the priority queue (default = infinity)")
+      .help(
+          "Maximum priority-queue size (default infinity; applied to each child search in "
+          "two-stage mode)")
       .metavar("N")
       .default_value(std::numeric_limits<size_t>::max())
       .store_into(args.pqlimit);
@@ -698,7 +783,7 @@ int main(int argc, char* argv[]) {
       .store_into(args.print_stats);
 
   program.add_argument("--sparsify-errors")
-      .help("Enables per-shot sparse error activation.")
+      .help("Enables per-shot sparse error activation (top child only in GARI two-stage mode).")
       .flag()
       .store_into(args.sparsify_errors);
   program.add_argument("--sparsify-base-degree")
@@ -761,8 +846,14 @@ int main(int argc, char* argv[]) {
       gari_config.top_detector_order_method = args.detector_order_method();
       gari_config.top_detector_order_seed = args.det_order_seed;
       gari_config.top_no_revisit_dets = args.no_revisit_dets;
+      gari_config.top_detector_orders = args.gari_top_detector_orders;
       gari_config.bottom_beam = args.gari_bottom_beam;
       gari_config.pqlimit = args.pqlimit;
+      gari_config.top_det_penalty = args.det_penalty;
+      gari_config.top_sparsify_errors = args.sparsify_errors;
+      gari_config.top_sparsify_base_degree = args.sparsify_base_degree;
+      gari_config.top_sparsify_max_degree = args.sparsify_max_degree;
+      gari_config.top_sparsify_reactivate_limit = args.sparsify_reactivate_limit;
       gari_config.verbose = args.verbose;
       gari_config.source_to_top_detector = args.gari_source_to_top_detector;
       for (auto& decoder : gari_decoders) {
@@ -780,7 +871,8 @@ int main(int argc, char* argv[]) {
   double decoder_setup_time_seconds =
       std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - decoder_setup_start)
           .count();
-  size_t error_use_count = args.gari_two_stage ? 0 : original_dem.count_errors();
+  size_t error_use_count =
+      !args.gari_two_stage || !args.dem_out_fname.empty() ? original_dem.count_errors() : 0;
   std::vector<std::vector<size_t>> error_use_per_thread(
       args.num_threads, std::vector<size_t>(error_use_count));
   bool has_obs = args.has_observables();
@@ -791,6 +883,7 @@ int main(int argc, char* argv[]) {
       shots.size(), args.num_threads,
       [&](size_t thread_index, size_t shot_index) {
         auto start_time = std::chrono::high_resolution_clock::now();
+        auto& error_use = error_use_per_thread[thread_index];
         if (args.gari_two_stage) {
           auto result = gari_decoders[thread_index]->decode(shots[shot_index].hits);
           obs_predicted[shot_index].clear();
@@ -803,9 +896,17 @@ int main(int argc, char* argv[]) {
             gari_unique_debts[shot_index] = result.unique_debts;
             gari_bottom_cache_hits[shot_index] = result.bottom_cache_hits;
           }
+          if ((!has_obs || shots[shot_index].obs_mask == obs_predicted[shot_index]) &&
+              !error_use.empty()) {
+            for (size_t error : result.physical_errors) {
+              ++error_use[error];
+            }
+            for (size_t error : result.top_errors) {
+              ++error_use[args.gari_two_stage_layout.physical_error_count + error];
+            }
+          }
         } else {
           auto& decoder = *decoders[thread_index];
-          auto& error_use = error_use_per_thread[thread_index];
           decoder.decode_to_errors(shots[shot_index].hits);
           obs_predicted[shot_index].clear();
           for (int observable : decoder.get_flipped_observables(decoder.predicted_errors_buffer)) {
@@ -870,10 +971,15 @@ int main(int argc, char* argv[]) {
   }
 
   int effective_sparsify_reactivate_limit = config.sparsify_reactivate_limit;
-  for (const auto& decoder : decoders) {
-    if (decoder) {
-      effective_sparsify_reactivate_limit = decoder->config.sparsify_reactivate_limit;
-      break;
+  if (args.gari_two_stage && args.sparsify_errors && !gari_decoders.empty()) {
+    effective_sparsify_reactivate_limit =
+        gari_decoders.front()->top_sparsify_reactivate_limit();
+  } else {
+    for (const auto& decoder : decoders) {
+      if (decoder) {
+        effective_sparsify_reactivate_limit = decoder->config.sparsify_reactivate_limit;
+        break;
+      }
     }
   }
   if (config.sparsify_errors && effective_sparsify_reactivate_limit == -1) {

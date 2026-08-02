@@ -108,7 +108,7 @@ TesseractConfig child_config(const stim::DetectorErrorModel& dem,
   child.verbose = config.verbose;
   child.merge_errors = false;
   child.pqlimit = config.pqlimit;
-  child.det_penalty = config.det_penalty;
+  child.det_penalty = 0;
   child.create_visualization = false;
   child.sparsify_errors = false;
   return child;
@@ -116,6 +116,23 @@ TesseractConfig child_config(const stim::DetectorErrorModel& dem,
 
 std::vector<std::vector<size_t>> build_top_orders(const stim::DetectorErrorModel& dem,
                                                   const GariTwoStageConfig& config) {
+  if (!config.top_detector_orders.empty()) {
+    const size_t detector_count = dem.count_detectors();
+    for (const auto& order : config.top_detector_orders) {
+      if (order.size() != detector_count) {
+        throw std::invalid_argument("GARI explicit top detector order has the wrong size.");
+      }
+      std::vector<bool> seen(detector_count);
+      for (size_t detector : order) {
+        if (detector >= detector_count || seen[detector]) {
+          throw std::invalid_argument(
+              "GARI explicit top detector order must be a permutation.");
+        }
+        seen[detector] = true;
+      }
+    }
+    return config.top_detector_orders;
+  }
   if (config.top_detector_order_method != DetOrder::DetIndex ||
       config.source_to_top_detector.empty()) {
     return build_det_orders(dem, config.num_top_detector_orders,
@@ -267,7 +284,7 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
         "GARI observables must occur on physical errors in the bottom model only.");
   }
 
-  if (config_.num_top_detector_orders == 0) {
+  if (config_.num_top_detector_orders == 0 && config_.top_detector_orders.empty()) {
     throw std::invalid_argument("GARI top detector-order count must be positive.");
   }
   if (config_.max_top_beam >= INF_DET_BEAM || config_.bottom_beam >= INF_DET_BEAM) {
@@ -276,6 +293,11 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   TesseractConfig top_config = child_config(top_dem_, config_);
   top_config.det_beam = config_.max_top_beam;
   top_config.no_revisit_dets = config_.top_no_revisit_dets;
+  top_config.det_penalty = config_.top_det_penalty;
+  top_config.sparsify_errors = config_.top_sparsify_errors;
+  top_config.sparsify_base_degree = config_.top_sparsify_base_degree;
+  top_config.sparsify_max_degree = config_.top_sparsify_max_degree;
+  top_config.sparsify_reactivate_limit = config_.top_sparsify_reactivate_limit;
   top_config.det_orders = build_top_orders(top_dem_, config_);
 
   TesseractConfig bottom_config = child_config(bottom_dem_, config_);
@@ -304,16 +326,16 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
 
   GariTwoStageDecodeResult result;
   std::unordered_map<std::vector<uint64_t>, BottomOutcome, VectorHash> bottom_cache;
+  const size_t top_order_count = top_decoder_->config.det_orders.size();
 
   const size_t top_trial_count = config_.top_beam_climbing
-                                     ? std::max(config_.max_top_beam + 1,
-                                                config_.num_top_detector_orders)
-                                     : config_.num_top_detector_orders;
+                                     ? std::max(config_.max_top_beam + 1, top_order_count)
+                                     : top_order_count;
   for (size_t trial = 0; trial < top_trial_count; ++trial) {
     const size_t top_beam = config_.top_beam_climbing
                                 ? trial % (config_.max_top_beam + 1)
                                 : config_.max_top_beam;
-    const size_t top_detector_order = trial % config_.num_top_detector_orders;
+    const size_t top_detector_order = trial % top_order_count;
 
     top_decoder_->decode_to_errors(top_detections, top_detector_order, top_beam);
 
