@@ -287,6 +287,9 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   if (config_.num_top_detector_orders == 0 && config_.top_detector_orders.empty()) {
     throw std::invalid_argument("GARI top detector-order count must be positive.");
   }
+  if (config_.top_candidates_per_trial == 0) {
+    throw std::invalid_argument("GARI top candidate count must be positive.");
+  }
   if (config_.max_top_beam >= INF_DET_BEAM || config_.bottom_beam >= INF_DET_BEAM) {
     throw std::invalid_argument("GARI two-stage beams must be below the infinity sentinel.");
   }
@@ -326,29 +329,14 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
 
   GariTwoStageDecodeResult result;
   std::unordered_map<std::vector<uint64_t>, BottomOutcome, VectorHash> bottom_cache;
-  const size_t top_order_count = top_decoder_->config.det_orders.size();
-
-  const size_t top_trial_count = config_.top_beam_climbing
-                                     ? std::max(config_.max_top_beam + 1, top_order_count)
-                                     : top_order_count;
-  for (size_t trial = 0; trial < top_trial_count; ++trial) {
-    const size_t top_beam = config_.top_beam_climbing
-                                ? trial % (config_.max_top_beam + 1)
-                                : config_.max_top_beam;
-    const size_t top_detector_order = trial % top_order_count;
-
-    top_decoder_->decode_to_errors(top_detections, top_detector_order, top_beam);
-
-    if (top_decoder_->low_confidence_flag) {
-      continue;
-    }
-    if (!reproduces_syndrome(top_error_detectors_, top_decoder_->predicted_errors_buffer,
-                             top_detections, layout.physical_detector_count)) {
+  auto consider_candidate = [&](const std::vector<size_t>& top_errors) {
+    if (!reproduces_syndrome(top_error_detectors_, top_errors, top_detections,
+                             layout.physical_detector_count)) {
       throw std::runtime_error("Completed top GARI candidate does not reproduce its syndrome.");
     }
 
     std::vector<bool> debt_bits(layout.virtual_detector_count, false);
-    for (size_t error : top_decoder_->predicted_errors_buffer) {
+    for (size_t error : top_errors) {
       if (error >= top_error_to_bottom_detector_.size()) {
         throw std::runtime_error("Top decoder returned an invalid barred-error index.");
       }
@@ -361,6 +349,7 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
         debt.push_back(detector);
       }
     }
+
     BottomOutcome outcome;
     auto cached = bottom_cache.find(debt);
     if (cached != bottom_cache.end()) {
@@ -383,16 +372,36 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       bottom_cache.emplace(debt, outcome);
     }
 
-    if (!outcome.completed) {
-      continue;
-    }
-
-    if (outcome.cost < result.physical_cost) {
+    if (outcome.completed && outcome.cost < result.physical_cost) {
       result.completed = true;
       result.physical_cost = outcome.cost;
       result.observables = std::move(outcome.observables);
-      result.top_errors = top_decoder_->predicted_errors_buffer;
+      result.top_errors = top_errors;
       result.physical_errors = std::move(outcome.errors);
+    }
+  };
+  const size_t top_order_count = top_decoder_->config.det_orders.size();
+
+  const size_t top_trial_count = config_.top_beam_climbing
+                                     ? std::max(config_.max_top_beam + 1, top_order_count)
+                                     : top_order_count;
+  for (size_t trial = 0; trial < top_trial_count; ++trial) {
+    const size_t top_beam = config_.top_beam_climbing
+                                ? trial % (config_.max_top_beam + 1)
+                                : config_.max_top_beam;
+    const size_t top_detector_order = trial % top_order_count;
+
+    if (config_.top_candidates_per_trial == 1) {
+      top_decoder_->decode_to_errors(top_detections, top_detector_order, top_beam);
+      if (!top_decoder_->low_confidence_flag) {
+        consider_candidate(top_decoder_->predicted_errors_buffer);
+      }
+    } else {
+      auto top_candidates = top_decoder_->decode_to_error_candidates(
+          top_detections, top_detector_order, top_beam, config_.top_candidates_per_trial);
+      for (const auto& top_errors : top_candidates) {
+        consider_candidate(top_errors);
+      }
     }
   }
   result.unique_debts = bottom_cache.size();

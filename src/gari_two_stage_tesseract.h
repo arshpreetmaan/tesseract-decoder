@@ -27,6 +27,7 @@ struct GariTwoStageConfig {
   size_t max_top_beam = 20;
   bool top_beam_climbing = false;
   size_t num_top_detector_orders = 21;
+  size_t top_candidates_per_trial = 1;
   DetOrder top_detector_order_method = DetOrder::DetIndex;
   uint64_t top_detector_order_seed = 0;
   bool top_no_revisit_dets = false;

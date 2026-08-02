@@ -43,7 +43,9 @@ A fixed beam with one top order performs one top-and-bottom pass:
 
 Add `--beam-climbing` to test beams 0 through 20. Set
 `--num-det-orders 21` to cycle through 21 randomized top index orders during
-that outer schedule.
+that outer schedule. Set `--gari-top-candidates K` to retain up to `K`
+completed candidates from each top beam/order search before physical-cost
+reranking; its default is 1.
 
 Generate all GARI DEMs with the prior policies and detector orders for the
 targeted circuits. From the repository root:

@@ -92,6 +92,13 @@ struct TesseractDecoder {
   void decode_to_errors(const std::vector<uint64_t>& detections, size_t detector_order,
                         size_t detector_beam);
 
+  // Returns up to max_candidates distinct completed error sets from one
+  // detector-order/beam search. This continues the same priority queue after
+  // its first completion and is intended for candidate reranking experiments.
+  std::vector<std::vector<size_t>> decode_to_error_candidates(
+      const std::vector<uint64_t>& detections, size_t detector_order, size_t detector_beam,
+      size_t max_candidates);
+
   // Returns the bitwise XOR of the observables flipped by the errors in the given array, indexed by
   // the original flattened DEM error indices.
   std::vector<int> get_flipped_observables(const std::vector<size_t>& predicted_errors) const;
@@ -145,7 +152,9 @@ struct TesseractDecoder {
   void build_sparse_d2e(const std::vector<uint64_t>& detections);
   void decode_to_errors_with_graph(const std::vector<uint64_t>& detections, size_t detector_order,
                                    size_t detector_beam,
-                                   const std::vector<std::vector<int>>& active_d2e);
+                                   const std::vector<std::vector<int>>& active_d2e,
+                                   size_t max_candidates = 1,
+                                   std::vector<std::vector<size_t>>* candidates = nullptr);
 };
 
 #endif  // TESSERACT_DECODER_H

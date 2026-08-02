@@ -372,9 +372,26 @@ void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections,
   decode_to_errors_with_graph(detections, detector_order, detector_beam, active_d2e);
 }
 
+std::vector<std::vector<size_t>> TesseractDecoder::decode_to_error_candidates(
+    const std::vector<uint64_t>& detections, size_t detector_order, size_t detector_beam,
+    size_t max_candidates) {
+  if (max_candidates == 0) {
+    throw std::invalid_argument("max_candidates must be at least 1.");
+  }
+  if (config.sparsify_errors) {
+    build_sparse_d2e(detections);
+  }
+  const auto& active_d2e = config.sparsify_errors ? sparse_d2e : d2e;
+  std::vector<std::vector<size_t>> candidates;
+  decode_to_errors_with_graph(detections, detector_order, detector_beam, active_d2e,
+                              max_candidates, &candidates);
+  return candidates;
+}
+
 void TesseractDecoder::decode_to_errors_with_graph(
     const std::vector<uint64_t>& detections, size_t detector_order, size_t detector_beam,
-    const std::vector<std::vector<int>>& active_d2e) {
+    const std::vector<std::vector<int>>& active_d2e, size_t max_candidates,
+    std::vector<std::vector<size_t>>* candidates) {
   predicted_errors_buffer.clear();
   low_confidence_flag = false;
   error_chain_arena.clear();
@@ -457,14 +474,35 @@ void TesseractDecoder::decode_to_errors_with_graph(
         std::cout << "Decoding complete. Cost: " << node.cost
                   << " num_pq_pushed = " << num_pq_pushed << std::endl;
       }
-      predicted_errors_buffer.resize(node.depth);
+      if (candidates == nullptr) {
+        predicted_errors_buffer.resize(node.depth);
+        int64_t walker_idx = node.error_chain_idx;
+        for (size_t i = 0; i < node.depth; ++i) {
+          predicted_errors_buffer[node.depth - 1 - i] =
+              error_to_dem_error[error_chain_arena[walker_idx].error_index];
+          walker_idx = error_chain_arena[walker_idx].parent_idx;
+        }
+        return;
+      }
+
+      std::vector<size_t> completed_errors(node.depth);
       int64_t walker_idx = node.error_chain_idx;
       for (size_t i = 0; i < node.depth; ++i) {
-        predicted_errors_buffer[node.depth - 1 - i] =
+        completed_errors[node.depth - 1 - i] =
             error_to_dem_error[error_chain_arena[walker_idx].error_index];
         walker_idx = error_chain_arena[walker_idx].parent_idx;
       }
-      return;
+      std::sort(completed_errors.begin(), completed_errors.end());
+      if (std::find(candidates->begin(), candidates->end(), completed_errors) ==
+          candidates->end()) {
+        candidates->push_back(std::move(completed_errors));
+      }
+      if (candidates->size() >= max_candidates) {
+        return;
+      }
+      min_num_dets = 0;
+      max_num_dets = std::min(max_num_dets, detector_beam);
+      continue;
     }
 
     if (config.no_revisit_dets && !visited_detectors[node.num_dets].insert(detectors).second)
@@ -593,9 +631,12 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
       if (num_pq_pushed > config.pqlimit) {
         if (config.verbose) {
-          std::cout << "setting low confidence flag" << std::endl;
+          std::cout << (candidates != nullptr && !candidates->empty()
+                            ? "stopping candidate search at priority-queue limit"
+                            : "setting low confidence flag")
+                    << std::endl;
         }
-        low_confidence_flag = true;
+        low_confidence_flag = candidates == nullptr || candidates->empty();
         return;
       }
     }
@@ -604,10 +645,10 @@ void TesseractDecoder::decode_to_errors_with_graph(
   if (!pq.empty()) {
     throw std::runtime_error("Priority queue should be empty after decoding failure.");
   }
-  if (config.verbose) {
+  if (config.verbose && (candidates == nullptr || candidates->empty())) {
     std::cout << "Decoding failed to converge within beam limit." << std::endl;
   }
-  low_confidence_flag = true;
+  low_confidence_flag = candidates == nullptr || candidates->empty();
 }
 
 double TesseractDecoder::cost_from_errors(const std::vector<size_t>& predicted_errors) const {

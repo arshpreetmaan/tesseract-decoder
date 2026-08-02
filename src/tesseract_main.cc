@@ -165,6 +165,7 @@ struct Args {
   std::string custom_order;
   bool gari_two_stage = false;
   size_t gari_bottom_beam = 2;
+  size_t gari_top_candidates = 1;
   GariTwoStageLayout gari_two_stage_layout;
   std::vector<size_t> gari_source_to_top_detector;
   std::vector<std::vector<size_t>> gari_top_detector_orders;
@@ -308,6 +309,9 @@ struct Args {
       }
       if (num_det_orders == 0) {
         throw std::invalid_argument("--num-det-orders must be at least 1");
+      }
+      if (gari_top_candidates == 0) {
+        throw std::invalid_argument("--gari-top-candidates must be at least 1");
       }
     }
 
@@ -611,6 +615,11 @@ int main(int argc, char* argv[]) {
       .metavar("N")
       .default_value(size_t(2))
       .store_into(args.gari_bottom_beam);
+  program.add_argument("--gari-top-candidates")
+      .help("Maximum completed top candidates per GARI beam/order trial")
+      .metavar("N")
+      .default_value(size_t(1))
+      .store_into(args.gari_top_candidates);
   program.add_argument("--no-merge-errors")
       .help(
           "If provided, will not merge identical error mechanisms (two-stage children never merge)")
@@ -843,6 +852,7 @@ int main(int argc, char* argv[]) {
       gari_config.max_top_beam = args.det_beam;
       gari_config.top_beam_climbing = args.beam_climbing;
       gari_config.num_top_detector_orders = args.num_det_orders;
+      gari_config.top_candidates_per_trial = args.gari_top_candidates;
       gari_config.top_detector_order_method = args.detector_order_method();
       gari_config.top_detector_order_seed = args.det_order_seed;
       gari_config.top_no_revisit_dets = args.no_revisit_dets;
@@ -1020,10 +1030,14 @@ int main(int argc, char* argv[]) {
         {"sparsify_reactivate_limit", effective_sparsify_reactivate_limit}};
 
     if (args.gari_two_stage) {
+      size_t total_unique_debts = std::accumulate(
+          gari_unique_debts.begin(), gari_unique_debts.begin() + shot, size_t{0});
       stats_json["gari_two_stage"] = {
           {"bottom_beam", args.gari_bottom_beam},
-          {"total_unique_debts_across_shots",
-           std::accumulate(gari_unique_debts.begin(), gari_unique_debts.begin() + shot, size_t{0})},
+          {"top_candidates_per_trial", args.gari_top_candidates},
+          {"average_unique_top_candidates_per_shot",
+           shot == 0 ? 0.0 : static_cast<double>(total_unique_debts) / shot},
+          {"total_unique_debts_across_shots", total_unique_debts},
           {"bottom_cache_hits",
            std::accumulate(gari_bottom_cache_hits.begin(),
                            gari_bottom_cache_hits.begin() + shot, size_t{0})},
