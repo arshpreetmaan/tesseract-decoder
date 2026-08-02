@@ -28,6 +28,7 @@ struct GariTwoStageConfig {
   size_t num_top_detector_orders = 21;
   DetOrder top_detector_order_method = DetOrder::DetIndex;
   uint64_t top_detector_order_seed = 0;
+  bool top_no_revisit_dets = false;
   size_t bottom_beam = 2;
   size_t pqlimit = DEFAULT_PQLIMIT;
   double det_penalty = 0;
@@ -64,6 +65,12 @@ class GariTwoStageTesseractDecoder {
   }
   const stim::DetectorErrorModel& bottom_dem() const {
     return bottom_dem_;
+  }
+  bool top_no_revisit_dets_enabled() const {
+    return top_decoder_->config.no_revisit_dets;
+  }
+  bool bottom_no_revisit_dets_enabled() const {
+    return bottom_decoder_->config.no_revisit_dets;
   }
 
  private:

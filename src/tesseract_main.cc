@@ -241,11 +241,11 @@ struct Args {
         throw std::invalid_argument(
             "--gari-two-stage requires --dem and --det-mapping-file");
       }
-      if (!custom_order.empty() || det_order_coordinate || no_revisit_dets || sparsify_errors ||
-          det_penalty != 0 || !dem_out_fname.empty()) {
+      if (!custom_order.empty() || det_order_coordinate || sparsify_errors || det_penalty != 0 ||
+          !dem_out_fname.empty()) {
         throw std::invalid_argument(
-            "GARI two-stage decoding does not use custom/coordinate orders, no-revisit, "
-            "detector penalties, sparsification, or --dem-out");
+            "GARI two-stage decoding does not use custom/coordinate orders, detector penalties, "
+            "sparsification, or --dem-out");
       }
       if (!program.is_used("--beam")) {
         det_beam = 20;
@@ -679,7 +679,8 @@ int main(int argc, char* argv[]) {
       .flag()
       .store_into(args.beam_climbing);
   program.add_argument("--no-revisit-dets")
-      .help("Use no-revisit-dets heuristic")
+      .help(
+          "Use no-revisit-dets heuristic (applies only to the top child in GARI two-stage mode)")
       .flag()
       .store_into(args.no_revisit_dets);
 
@@ -761,6 +762,7 @@ int main(int argc, char* argv[]) {
       gari_config.num_top_detector_orders = args.num_det_orders;
       gari_config.top_detector_order_method = args.detector_order_method();
       gari_config.top_detector_order_seed = args.det_order_seed;
+      gari_config.top_no_revisit_dets = args.no_revisit_dets;
       gari_config.bottom_beam = args.gari_bottom_beam;
       gari_config.pqlimit = args.pqlimit;
       gari_config.verbose = args.verbose;

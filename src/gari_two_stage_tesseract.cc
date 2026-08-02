@@ -102,6 +102,8 @@ TesseractConfig child_config(const stim::DetectorErrorModel& dem,
   TesseractConfig child;
   child.dem = dem;
   child.beam_climbing = false;
+  // The bottom always permits revisits; the top overrides this from its
+  // top-specific configuration after the common child settings are built.
   child.no_revisit_dets = false;
   child.verbose = config.verbose;
   child.merge_errors = false;
@@ -273,6 +275,7 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   }
   TesseractConfig top_config = child_config(top_dem_, config_);
   top_config.det_beam = config_.max_top_beam;
+  top_config.no_revisit_dets = config_.top_no_revisit_dets;
   top_config.det_orders = build_top_orders(top_dem_, config_);
 
   TesseractConfig bottom_config = child_config(bottom_dem_, config_);

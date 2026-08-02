@@ -46,10 +46,13 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   };
   config.max_top_beam = 1;
   config.num_top_detector_orders = 2;
+  config.top_no_revisit_dets = true;
   config.bottom_beam = 2;
   config.source_to_top_detector = {1, 0};
 
   GariTwoStageTesseractDecoder decoder(dem, config);
+  EXPECT_TRUE(decoder.top_no_revisit_dets_enabled());
+  EXPECT_FALSE(decoder.bottom_no_revisit_dets_enabled());
   auto result = decoder.decode({0, 1});
 
   ASSERT_TRUE(result.completed);
