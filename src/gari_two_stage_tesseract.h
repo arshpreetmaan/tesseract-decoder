@@ -38,6 +38,7 @@ struct GariTwoStageConfig {
   int top_sparsify_base_degree = -1;
   int top_sparsify_max_degree = -1;
   int top_sparsify_reactivate_limit = -1;
+  bool collect_bottom_timing = false;
   bool verbose = false;
   std::vector<std::vector<size_t>> top_detector_orders;
   // Source detector index -> top GARI detector index. DetIndex orders follow
@@ -54,6 +55,7 @@ struct GariTwoStageDecodeResult {
 
   size_t unique_debts = 0;
   size_t bottom_cache_hits = 0;
+  double bottom_decode_time_seconds = 0;
 };
 
 // Runs a fresh top search at every beam/order trial, then completes each top

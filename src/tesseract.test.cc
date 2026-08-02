@@ -51,6 +51,7 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   config.top_sparsify_base_degree = 1;
   config.top_sparsify_reactivate_limit = 0;
   config.bottom_beam = 2;
+  config.collect_bottom_timing = true;
   config.source_to_top_detector = {1, 0};
 
   GariTwoStageTesseractDecoder decoder(dem, config);
@@ -67,6 +68,8 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   EXPECT_NEAR(result.physical_cost, -std::log(0.05 / 0.95), EPSILON);
   EXPECT_EQ(result.unique_debts, 1);
   EXPECT_EQ(result.bottom_cache_hits, 1);
+  EXPECT_TRUE(std::isfinite(result.bottom_decode_time_seconds));
+  EXPECT_GE(result.bottom_decode_time_seconds, 0);
 
   config.max_top_beam = 3;
   config.top_beam_climbing = true;

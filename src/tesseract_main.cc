@@ -844,6 +844,7 @@ int main(int argc, char* argv[]) {
   const bool collect_gari_stats = args.gari_two_stage && !args.stats_out_fname.empty();
   std::vector<size_t> gari_unique_debts(collect_gari_stats ? shots.size() : 0);
   std::vector<size_t> gari_bottom_cache_hits(collect_gari_stats ? shots.size() : 0);
+  std::vector<double> gari_bottom_decode_time_seconds(collect_gari_stats ? shots.size() : 0);
   GariTwoStageConfig gari_config;
   auto decoder_setup_start = std::chrono::high_resolution_clock::now();
   try {
@@ -864,6 +865,7 @@ int main(int argc, char* argv[]) {
       gari_config.top_sparsify_base_degree = args.sparsify_base_degree;
       gari_config.top_sparsify_max_degree = args.sparsify_max_degree;
       gari_config.top_sparsify_reactivate_limit = args.sparsify_reactivate_limit;
+      gari_config.collect_bottom_timing = collect_gari_stats;
       gari_config.verbose = args.verbose;
       gari_config.source_to_top_detector = args.gari_source_to_top_detector;
       for (auto& decoder : gari_decoders) {
@@ -905,6 +907,7 @@ int main(int argc, char* argv[]) {
           if (collect_gari_stats) {
             gari_unique_debts[shot_index] = result.unique_debts;
             gari_bottom_cache_hits[shot_index] = result.bottom_cache_hits;
+            gari_bottom_decode_time_seconds[shot_index] = result.bottom_decode_time_seconds;
           }
           if ((!has_obs || shots[shot_index].obs_mask == obs_predicted[shot_index]) &&
               !error_use.empty()) {
@@ -1032,6 +1035,9 @@ int main(int argc, char* argv[]) {
     if (args.gari_two_stage) {
       size_t total_unique_debts = std::accumulate(
           gari_unique_debts.begin(), gari_unique_debts.begin() + shot, size_t{0});
+      double bottom_decode_time_seconds = std::accumulate(
+          gari_bottom_decode_time_seconds.begin(),
+          gari_bottom_decode_time_seconds.begin() + shot, 0.0);
       stats_json["gari_two_stage"] = {
           {"bottom_beam", args.gari_bottom_beam},
           {"top_candidates_per_trial", args.gari_top_candidates},
@@ -1041,6 +1047,11 @@ int main(int argc, char* argv[]) {
           {"bottom_cache_hits",
            std::accumulate(gari_bottom_cache_hits.begin(),
                            gari_bottom_cache_hits.begin() + shot, size_t{0})},
+          {"bottom_decode_time_seconds", bottom_decode_time_seconds},
+          {"bottom_decode_time_fraction_of_total",
+           total_time_seconds <= 0
+               ? 0.0
+               : std::clamp(bottom_decode_time_seconds / total_time_seconds, 0.0, 1.0)},
       };
     }
 

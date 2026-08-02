@@ -1,6 +1,7 @@
 #include "gari_two_stage_tesseract.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <random>
@@ -356,7 +357,14 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       ++result.bottom_cache_hits;
       outcome = cached->second;
     } else {
-      bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0, config_.bottom_beam);
+      if (config_.collect_bottom_timing) {
+        const auto start = std::chrono::steady_clock::now();
+        bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0, config_.bottom_beam);
+        result.bottom_decode_time_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      } else {
+        bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0, config_.bottom_beam);
+      }
 
       outcome.completed = !bottom_decoder_->low_confidence_flag;
       if (outcome.completed) {

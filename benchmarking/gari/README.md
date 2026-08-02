@@ -47,6 +47,11 @@ that outer schedule. Set `--gari-top-candidates K` to retain up to `K`
 completed candidates from each top beam/order search before physical-cost
 reranking; its default is 1.
 
+With `--stats-out`, the `gari_two_stage` JSON block reports
+`bottom_decode_time_seconds` and `bottom_decode_time_fraction_of_total`. These
+measure bottom Tesseract solver calls on cache misses; the fraction uses the
+existing aggregate `total_time_seconds` value.
+
 Generate all GARI DEMs with the prior policies and detector orders for the
 targeted circuits. From the repository root:
 
