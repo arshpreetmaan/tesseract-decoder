@@ -23,6 +23,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <utility>
 
 namespace {
 
@@ -150,7 +151,7 @@ double TesseractDecoder::get_detcost(size_t d,
   return (min_cost / min_det_cost_det_count) + config.det_penalty;
 }
 
-TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(config_) {
+TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(config_)) {
   std::vector<size_t> dem_error_map(config.dem.flattened().count_errors());
   std::iota(dem_error_map.begin(), dem_error_map.end(), 0);
 

@@ -56,7 +56,7 @@ void validate_layout(const stim::DetectorErrorModel& dem, const GariTwoStageLayo
   if (dem.count_detectors() != detector_count) {
     throw std::invalid_argument("GARI detector count does not match the two-stage layout.");
   }
-  if (dem.flattened().count_errors() != error_count) {
+  if (dem.count_errors() != error_count) {
     throw std::invalid_argument("GARI error count does not match the two-stage layout.");
   }
 
@@ -167,19 +167,18 @@ std::vector<std::vector<size_t>> build_top_orders(const stim::DetectorErrorModel
 
 }  // namespace
 
-GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
-    const stim::DetectorErrorModel& gari_dem, GariTwoStageConfig config)
-    : config_(std::move(config)) {
-  validate_layout(gari_dem, config_.layout);
-
-  const auto& layout = config_.layout;
+std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
+    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout) {
+  const stim::DetectorErrorModel flat_dem = gari_dem.flattened();
+  validate_layout(flat_dem, layout);
+  auto prepared = std::make_shared<GariTwoStagePreparedModel>();
+  prepared->layout = layout;
   const size_t physical_detectors = layout.physical_detector_count;
   const size_t all_detectors = physical_detectors + layout.virtual_detector_count;
-  const stim::DetectorErrorModel flat_dem = gari_dem.flattened();
 
-  top_error_to_bottom_detector_.reserve(layout.barred_error_count);
-  top_error_detectors_.reserve(layout.barred_error_count);
-  bottom_error_detectors_.reserve(layout.physical_error_count);
+  prepared->top_error_to_bottom_detector.reserve(layout.barred_error_count);
+  prepared->top_error_detectors.reserve(layout.barred_error_count);
+  prepared->bottom_error_detectors.reserve(layout.physical_error_count);
 
   size_t error_index = 0;
   for (const stim::DemInstruction& instruction : flat_dem.instructions) {
@@ -247,14 +246,14 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
         throw std::invalid_argument(
             "A physical Y error must target exactly two virtual detectors.");
       }
-      bottom_dem_.append_error_instruction(instruction.arg_data[0], bottom_targets,
-                                           instruction.tag);
+      prepared->bottom_dem.append_error_instruction(instruction.arg_data[0], bottom_targets,
+                                                     instruction.tag);
       std::vector<size_t> local_targets;
       local_targets.reserve(virtual_targets.size());
       for (size_t detector : virtual_targets) {
         local_targets.push_back(detector - physical_detectors);
       }
-      bottom_error_detectors_.push_back(std::move(local_targets));
+      prepared->bottom_error_detectors.push_back(std::move(local_targets));
     } else {
       const size_t barred_error = error_index - layout.physical_error_count;
       const size_t expected_virtual = layout.barred_error_to_virtual_detector[barred_error];
@@ -263,28 +262,39 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
         throw std::invalid_argument(
             "A barred GARI error violates the top block or its debt identity.");
       }
-      top_dem_.append_error_instruction(instruction.arg_data[0], top_targets, instruction.tag);
-      top_error_to_bottom_detector_.push_back(expected_virtual - physical_detectors);
-      top_error_detectors_.push_back(std::move(physical_targets));
+      prepared->top_dem.append_error_instruction(instruction.arg_data[0], top_targets,
+                                                 instruction.tag);
+      prepared->top_error_to_bottom_detector.push_back(expected_virtual - physical_detectors);
+      prepared->top_error_detectors.push_back(std::move(physical_targets));
     }
     ++error_index;
   }
 
   if (error_index != layout.physical_error_count + layout.barred_error_count ||
-      top_dem_.count_errors() != layout.barred_error_count ||
-      bottom_dem_.count_errors() != layout.physical_error_count) {
+      prepared->top_dem.count_errors() != layout.barred_error_count ||
+      prepared->bottom_dem.count_errors() != layout.physical_error_count) {
     throw std::invalid_argument("GARI DEM split did not preserve all configured errors.");
   }
-  if (top_dem_.count_detectors() != layout.physical_detector_count ||
-      bottom_dem_.count_detectors() != layout.virtual_detector_count) {
+  if (prepared->top_dem.count_detectors() != layout.physical_detector_count ||
+      prepared->bottom_dem.count_detectors() != layout.virtual_detector_count) {
     throw std::invalid_argument("GARI child detector dimensions do not match the layout.");
   }
-  if (top_dem_.count_observables() != 0 ||
-      bottom_dem_.count_observables() != gari_dem.count_observables()) {
+  if (prepared->top_dem.count_observables() != 0 ||
+      prepared->bottom_dem.count_observables() != gari_dem.count_observables()) {
     throw std::invalid_argument(
         "GARI observables must occur on physical errors in the bottom model only.");
   }
+  return prepared;
+}
 
+GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
+    std::shared_ptr<const GariTwoStagePreparedModel> prepared_model,
+    GariTwoStageConfig config)
+    : prepared_model_(std::move(prepared_model)), config_(std::move(config)) {
+  if (!prepared_model_) {
+    throw std::invalid_argument("GARI two-stage prepared model must not be null.");
+  }
+  const auto& layout = prepared_model_->layout;
   if (config_.num_top_detector_orders == 0 && config_.top_detector_orders.empty()) {
     throw std::invalid_argument("GARI top detector-order count must be positive.");
   }
@@ -297,7 +307,7 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   if (config_.max_top_beam >= INF_DET_BEAM || config_.bottom_beam >= INF_DET_BEAM) {
     throw std::invalid_argument("GARI two-stage beams must be below the infinity sentinel.");
   }
-  TesseractConfig top_config = child_config(top_dem_, config_);
+  TesseractConfig top_config = child_config(prepared_model_->top_dem, config_);
   top_config.det_beam = config_.max_top_beam;
   top_config.no_revisit_dets = config_.top_no_revisit_dets;
   top_config.det_penalty = config_.top_det_penalty;
@@ -305,9 +315,9 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   top_config.sparsify_base_degree = config_.top_sparsify_base_degree;
   top_config.sparsify_max_degree = config_.top_sparsify_max_degree;
   top_config.sparsify_reactivate_limit = config_.top_sparsify_reactivate_limit;
-  top_config.det_orders = build_top_orders(top_dem_, config_);
+  top_config.det_orders = build_top_orders(prepared_model_->top_dem, config_);
 
-  TesseractConfig bottom_config = child_config(bottom_dem_, config_);
+  TesseractConfig bottom_config = child_config(prepared_model_->bottom_dem, config_);
   bottom_config.det_beam = config_.bottom_beam;
   bottom_config.det_orders.resize(config_.num_bottom_detector_orders);
   for (auto& order : bottom_config.det_orders) {
@@ -326,7 +336,7 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
 
 GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
     const std::vector<uint64_t>& top_detections) {
-  const auto& layout = config_.layout;
+  const auto& layout = prepared_model_->layout;
   std::vector<bool> seen_detection(layout.physical_detector_count, false);
   for (uint64_t detector : top_detections) {
     if (detector >= layout.physical_detector_count) {
@@ -341,17 +351,17 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
   GariTwoStageDecodeResult result;
   std::unordered_map<std::vector<uint64_t>, BottomOutcome, VectorHash> bottom_cache;
   auto consider_candidate = [&](const std::vector<size_t>& top_errors) {
-    if (!reproduces_syndrome(top_error_detectors_, top_errors, top_detections,
+    if (!reproduces_syndrome(prepared_model_->top_error_detectors, top_errors, top_detections,
                              layout.physical_detector_count)) {
       throw std::runtime_error("Completed top GARI candidate does not reproduce its syndrome.");
     }
 
     std::vector<bool> debt_bits(layout.virtual_detector_count, false);
     for (size_t error : top_errors) {
-      if (error >= top_error_to_bottom_detector_.size()) {
+      if (error >= prepared_model_->top_error_to_bottom_detector.size()) {
         throw std::runtime_error("Top decoder returned an invalid barred-error index.");
       }
-      size_t detector = top_error_to_bottom_detector_[error];
+      size_t detector = prepared_model_->top_error_to_bottom_detector[error];
       debt_bits[detector] = !debt_bits[detector];
     }
     std::vector<uint64_t> debt;
@@ -387,7 +397,7 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       outcome.completed = !bottom_decoder_->low_confidence_flag;
       if (outcome.completed) {
         outcome.errors = bottom_decoder_->predicted_errors_buffer;
-        if (!reproduces_syndrome(bottom_error_detectors_, outcome.errors, debt,
+        if (!reproduces_syndrome(prepared_model_->bottom_error_detectors, outcome.errors, debt,
                                  layout.virtual_detector_count)) {
           throw std::runtime_error(
               "Completed bottom GARI candidate does not reproduce its debt syndrome.");

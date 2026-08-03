@@ -37,7 +37,7 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
     error(0.2) D1 D3
   )DEM");
   GariTwoStageConfig config;
-  config.layout = {
+  GariTwoStageLayout layout = {
       .physical_detector_count = 2,
       .virtual_detector_count = 2,
       .physical_error_count = 3,
@@ -53,8 +53,9 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   config.bottom_beam = 2;
   config.collect_bottom_timing = true;
   config.source_to_top_detector = {1, 0};
+  auto prepared_model = prepare_gari_two_stage_model(dem, layout);
 
-  GariTwoStageTesseractDecoder decoder(dem, config);
+  GariTwoStageTesseractDecoder decoder(prepared_model, config);
   EXPECT_TRUE(decoder.top_no_revisit_dets_enabled());
   EXPECT_FALSE(decoder.bottom_no_revisit_dets_enabled());
   EXPECT_EQ(decoder.top_sparsify_reactivate_limit(), 0);
@@ -74,7 +75,9 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   EXPECT_GE(result.bottom_decode_time_seconds, 0);
 
   config.num_bottom_detector_orders = 2;
-  GariTwoStageTesseractDecoder two_order_decoder(dem, config);
+  GariTwoStageTesseractDecoder two_order_decoder(prepared_model, config);
+  EXPECT_EQ(&decoder.top_dem(), &two_order_decoder.top_dem());
+  EXPECT_EQ(&decoder.bottom_dem(), &two_order_decoder.bottom_dem());
   EXPECT_EQ(two_order_decoder.bottom_detector_orders(),
             (std::vector<std::vector<size_t>>{{0, 1}, {1, 0}}));
   auto two_order_result = two_order_decoder.decode({0, 1});
@@ -86,7 +89,7 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   config.num_bottom_detector_orders = 1;
   config.max_top_beam = 3;
   config.top_beam_climbing = true;
-  GariTwoStageTesseractDecoder climbing_decoder(dem, config);
+  GariTwoStageTesseractDecoder climbing_decoder(prepared_model, config);
   auto climbing_result = climbing_decoder.decode({0, 1});
   EXPECT_TRUE(climbing_result.completed);
   EXPECT_EQ(climbing_result.unique_debts, 1);
@@ -101,7 +104,7 @@ TEST(GariTwoStageTesseractTest, AdditionalTopCandidateImprovesPhysicalCost) {
     error(0.10) D0 D2
   )DEM");
   GariTwoStageConfig config;
-  config.layout = {
+  GariTwoStageLayout layout = {
       .physical_detector_count = 1,
       .virtual_detector_count = 2,
       .physical_error_count = 2,
@@ -112,8 +115,9 @@ TEST(GariTwoStageTesseractTest, AdditionalTopCandidateImprovesPhysicalCost) {
   config.num_top_detector_orders = 1;
   config.top_detector_orders = {{0}};
   config.bottom_beam = 0;
+  auto prepared_model = prepare_gari_two_stage_model(dem, layout);
 
-  GariTwoStageTesseractDecoder one_candidate_decoder(dem, config);
+  GariTwoStageTesseractDecoder one_candidate_decoder(prepared_model, config);
   auto one_candidate = one_candidate_decoder.decode({0});
   ASSERT_TRUE(one_candidate.completed);
   EXPECT_EQ(one_candidate.top_errors, (std::vector<size_t>{0}));
@@ -123,7 +127,7 @@ TEST(GariTwoStageTesseractTest, AdditionalTopCandidateImprovesPhysicalCost) {
   EXPECT_EQ(one_candidate.unique_debts, 1);
 
   config.top_candidates_per_trial = 2;
-  GariTwoStageTesseractDecoder two_candidate_decoder(dem, config);
+  GariTwoStageTesseractDecoder two_candidate_decoder(prepared_model, config);
   auto two_candidates = two_candidate_decoder.decode({0});
   ASSERT_TRUE(two_candidates.completed);
   EXPECT_EQ(two_candidates.top_errors, (std::vector<size_t>{1}));

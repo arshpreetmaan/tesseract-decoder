@@ -22,8 +22,21 @@ struct GariTwoStageLayout {
   std::vector<size_t> barred_error_to_virtual_detector;
 };
 
-struct GariTwoStageConfig {
+// Immutable result of validating and partitioning one monolithic GARI DEM.
+// This is prepared once and shared by the per-thread decoder instances.
+struct GariTwoStagePreparedModel {
   GariTwoStageLayout layout;
+  stim::DetectorErrorModel top_dem;
+  stim::DetectorErrorModel bottom_dem;
+  std::vector<size_t> top_error_to_bottom_detector;
+  std::vector<std::vector<size_t>> top_error_detectors;
+  std::vector<std::vector<size_t>> bottom_error_detectors;
+};
+
+std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
+    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout);
+
+struct GariTwoStageConfig {
   size_t max_top_beam = 20;
   bool top_beam_climbing = false;
   size_t num_top_detector_orders = 21;
@@ -65,16 +78,17 @@ struct GariTwoStageDecodeResult {
 // shot.
 class GariTwoStageTesseractDecoder {
  public:
-  GariTwoStageTesseractDecoder(const stim::DetectorErrorModel& gari_dem,
-                               GariTwoStageConfig config);
+  GariTwoStageTesseractDecoder(
+      std::shared_ptr<const GariTwoStagePreparedModel> prepared_model,
+      GariTwoStageConfig config);
 
   GariTwoStageDecodeResult decode(const std::vector<uint64_t>& top_detections);
 
   const stim::DetectorErrorModel& top_dem() const {
-    return top_dem_;
+    return prepared_model_->top_dem;
   }
   const stim::DetectorErrorModel& bottom_dem() const {
-    return bottom_dem_;
+    return prepared_model_->bottom_dem;
   }
   const std::vector<std::vector<size_t>>& bottom_detector_orders() const {
     return bottom_decoder_->config.det_orders;
@@ -90,12 +104,8 @@ class GariTwoStageTesseractDecoder {
   }
 
  private:
+  std::shared_ptr<const GariTwoStagePreparedModel> prepared_model_;
   GariTwoStageConfig config_;
-  stim::DetectorErrorModel top_dem_;
-  stim::DetectorErrorModel bottom_dem_;
-  std::vector<size_t> top_error_to_bottom_detector_;
-  std::vector<std::vector<size_t>> top_error_detectors_;
-  std::vector<std::vector<size_t>> bottom_error_detectors_;
   std::unique_ptr<TesseractDecoder> top_decoder_;
   std::unique_ptr<TesseractDecoder> bottom_decoder_;
 };

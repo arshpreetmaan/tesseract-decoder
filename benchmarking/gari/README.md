@@ -59,6 +59,11 @@ measure bottom Tesseract solver calls on cache misses; the fraction uses the
 existing aggregate `total_time_seconds` value. `bottom_num_det_orders`
 records the configured bottom-order count.
 
+`total_time_seconds` contains only accumulated shot-decoding time. Decoder
+construction and the one-time GARI partition are reported separately as
+`decoder_setup_time_seconds`. Timing results produced before this separation
+included setup in the total and should be rerun before direct comparison.
+
 Generate all GARI DEMs with the prior policies and detector orders for the
 targeted circuits. From the repository root:
 

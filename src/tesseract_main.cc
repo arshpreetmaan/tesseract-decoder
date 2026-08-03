@@ -847,18 +847,20 @@ int main(int argc, char* argv[]) {
   std::vector<double> cost_predicted(shots.size());
   std::vector<double> decoding_time_seconds(shots.size());
   std::vector<std::atomic<bool>> low_confidence(shots.size());
-  const stim::DetectorErrorModel original_dem = config.dem.flattened();
+  stim::DetectorErrorModel original_dem = config.dem.flattened();
   std::vector<std::unique_ptr<TesseractDecoder>> decoders(args.num_threads);
   std::vector<std::unique_ptr<GariTwoStageTesseractDecoder>> gari_decoders(args.num_threads);
   const bool collect_gari_stats = args.gari_two_stage && !args.stats_out_fname.empty();
   std::vector<size_t> gari_unique_debts(collect_gari_stats ? shots.size() : 0);
   std::vector<size_t> gari_bottom_cache_hits(collect_gari_stats ? shots.size() : 0);
   std::vector<double> gari_bottom_decode_time_seconds(collect_gari_stats ? shots.size() : 0);
+  std::shared_ptr<const GariTwoStagePreparedModel> gari_prepared_model;
   GariTwoStageConfig gari_config;
   auto decoder_setup_start = std::chrono::high_resolution_clock::now();
   try {
     if (args.gari_two_stage) {
-      gari_config.layout = args.gari_two_stage_layout;
+      gari_prepared_model =
+          prepare_gari_two_stage_model(original_dem, args.gari_two_stage_layout);
       gari_config.max_top_beam = args.det_beam;
       gari_config.top_beam_climbing = args.beam_climbing;
       gari_config.num_top_detector_orders = args.num_det_orders;
@@ -879,7 +881,8 @@ int main(int argc, char* argv[]) {
       gari_config.verbose = args.verbose;
       gari_config.source_to_top_detector = args.gari_source_to_top_detector;
       for (auto& decoder : gari_decoders) {
-        decoder = std::make_unique<GariTwoStageTesseractDecoder>(original_dem, gari_config);
+        decoder =
+            std::make_unique<GariTwoStageTesseractDecoder>(gari_prepared_model, gari_config);
       }
     } else {
       for (auto& decoder : decoders) {
@@ -897,17 +900,24 @@ int main(int argc, char* argv[]) {
       !args.gari_two_stage || !args.dem_out_fname.empty() ? original_dem.count_errors() : 0;
   std::vector<std::vector<size_t>> error_use_per_thread(
       args.num_threads, std::vector<size_t>(error_use_count));
+  if (args.gari_two_stage && args.dem_out_fname.empty()) {
+    config.dem = stim::DetectorErrorModel();
+    original_dem = stim::DetectorErrorModel();
+  }
   bool has_obs = args.has_observables();
   size_t num_errors = 0;
   size_t num_low_confidence = 0;
-  double total_time_seconds = decoder_setup_time_seconds;
+  double total_time_seconds = 0;
   size_t shot = parallel_for_shots_in_order(
       shots.size(), args.num_threads,
       [&](size_t thread_index, size_t shot_index) {
-        auto start_time = std::chrono::high_resolution_clock::now();
         auto& error_use = error_use_per_thread[thread_index];
         if (args.gari_two_stage) {
+          const auto start_time = std::chrono::high_resolution_clock::now();
           auto result = gari_decoders[thread_index]->decode(shots[shot_index].hits);
+          decoding_time_seconds[shot_index] =
+              std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_time)
+                  .count();
           obs_predicted[shot_index].clear();
           for (int observable : result.observables) {
             obs_predicted[shot_index][observable] ^= 1;
@@ -930,7 +940,11 @@ int main(int argc, char* argv[]) {
           }
         } else {
           auto& decoder = *decoders[thread_index];
+          const auto start_time = std::chrono::high_resolution_clock::now();
           decoder.decode_to_errors(shots[shot_index].hits);
+          decoding_time_seconds[shot_index] =
+              std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_time)
+                  .count();
           obs_predicted[shot_index].clear();
           for (int observable : decoder.get_flipped_observables(decoder.predicted_errors_buffer)) {
             obs_predicted[shot_index][observable] ^= 1;
@@ -943,10 +957,6 @@ int main(int argc, char* argv[]) {
             }
           }
         }
-        auto stop_time = std::chrono::high_resolution_clock::now();
-        decoding_time_seconds[shot_index] =
-            std::chrono::duration_cast<std::chrono::microseconds>(stop_time - start_time).count() /
-            1e6;
       },
       [&](size_t shot_index) {
         if (writer) {
@@ -1031,6 +1041,7 @@ int main(int argc, char* argv[]) {
         {"pqlimit", args.pqlimit},
         {"num_det_orders", args.num_det_orders},
         {"det_order_seed", args.det_order_seed},
+        {"decoder_setup_time_seconds", decoder_setup_time_seconds},
         {"total_time_seconds", total_time_seconds},
         {"num_errors", num_errors},
         {"num_low_confidence", num_low_confidence},
