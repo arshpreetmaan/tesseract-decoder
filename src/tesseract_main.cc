@@ -165,6 +165,7 @@ struct Args {
   std::string custom_order;
   bool gari_two_stage = false;
   size_t gari_bottom_beam = 2;
+  size_t gari_bottom_num_detector_orders = 1;
   size_t gari_top_candidates = 1;
   GariTwoStageLayout gari_two_stage_layout;
   std::vector<size_t> gari_source_to_top_detector;
@@ -312,6 +313,9 @@ struct Args {
       }
       if (gari_top_candidates == 0) {
         throw std::invalid_argument("--gari-top-candidates must be at least 1");
+      }
+      if (gari_bottom_num_detector_orders == 0 || gari_bottom_num_detector_orders > 2) {
+        throw std::invalid_argument("--gari-bottom-num-det-orders must be 1 or 2");
       }
     }
 
@@ -615,6 +619,11 @@ int main(int argc, char* argv[]) {
       .metavar("N")
       .default_value(size_t(2))
       .store_into(args.gari_bottom_beam);
+  program.add_argument("--gari-bottom-num-det-orders")
+      .help("Bottom index orders: 1 natural, or 2 natural and reverse")
+      .metavar("N")
+      .default_value(size_t(1))
+      .store_into(args.gari_bottom_num_detector_orders);
   program.add_argument("--gari-top-candidates")
       .help("Maximum completed top candidates per GARI beam/order trial")
       .metavar("N")
@@ -859,6 +868,7 @@ int main(int argc, char* argv[]) {
       gari_config.top_no_revisit_dets = args.no_revisit_dets;
       gari_config.top_detector_orders = args.gari_top_detector_orders;
       gari_config.bottom_beam = args.gari_bottom_beam;
+      gari_config.num_bottom_detector_orders = args.gari_bottom_num_detector_orders;
       gari_config.pqlimit = args.pqlimit;
       gari_config.top_det_penalty = args.det_penalty;
       gari_config.top_sparsify_errors = args.sparsify_errors;
@@ -1040,6 +1050,7 @@ int main(int argc, char* argv[]) {
           gari_bottom_decode_time_seconds.begin() + shot, 0.0);
       stats_json["gari_two_stage"] = {
           {"bottom_beam", args.gari_bottom_beam},
+          {"bottom_num_det_orders", args.gari_bottom_num_detector_orders},
           {"top_candidates_per_trial", args.gari_top_candidates},
           {"average_unique_top_candidates_per_shot",
            shot == 0 ? 0.0 : static_cast<double>(total_unique_debts) / shot},

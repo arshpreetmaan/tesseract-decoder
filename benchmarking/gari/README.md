@@ -47,10 +47,17 @@ that outer schedule. Set `--gari-top-candidates K` to retain up to `K`
 completed candidates from each top beam/order search before physical-cost
 reranking; its default is 1.
 
+Set `--gari-bottom-num-det-orders 2` to complete each new debt using both the
+natural and reversed bottom detector-index orders at the fixed
+`--gari-bottom-beam`, retaining the lower original physical cost. The default
+of 1 preserves the natural-order path. Detector-index ordering has only these
+two distinct directions, so larger values are rejected.
+
 With `--stats-out`, the `gari_two_stage` JSON block reports
 `bottom_decode_time_seconds` and `bottom_decode_time_fraction_of_total`. These
 measure bottom Tesseract solver calls on cache misses; the fraction uses the
-existing aggregate `total_time_seconds` value.
+existing aggregate `total_time_seconds` value. `bottom_num_det_orders`
+records the configured bottom-order count.
 
 Generate all GARI DEMs with the prior policies and detector orders for the
 targeted circuits. From the repository root:

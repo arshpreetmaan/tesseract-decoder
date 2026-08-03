@@ -58,6 +58,8 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   EXPECT_TRUE(decoder.top_no_revisit_dets_enabled());
   EXPECT_FALSE(decoder.bottom_no_revisit_dets_enabled());
   EXPECT_EQ(decoder.top_sparsify_reactivate_limit(), 0);
+  EXPECT_EQ(decoder.bottom_detector_orders(),
+            (std::vector<std::vector<size_t>>{{0, 1}}));
   auto result = decoder.decode({0, 1});
 
   ASSERT_TRUE(result.completed);
@@ -71,6 +73,17 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   EXPECT_TRUE(std::isfinite(result.bottom_decode_time_seconds));
   EXPECT_GE(result.bottom_decode_time_seconds, 0);
 
+  config.num_bottom_detector_orders = 2;
+  GariTwoStageTesseractDecoder two_order_decoder(dem, config);
+  EXPECT_EQ(two_order_decoder.bottom_detector_orders(),
+            (std::vector<std::vector<size_t>>{{0, 1}, {1, 0}}));
+  auto two_order_result = two_order_decoder.decode({0, 1});
+  ASSERT_TRUE(two_order_result.completed);
+  EXPECT_LE(two_order_result.physical_cost, result.physical_cost);
+  EXPECT_EQ(two_order_result.unique_debts, 1);
+  EXPECT_EQ(two_order_result.bottom_cache_hits, 1);
+
+  config.num_bottom_detector_orders = 1;
   config.max_top_beam = 3;
   config.top_beam_climbing = true;
   GariTwoStageTesseractDecoder climbing_decoder(dem, config);

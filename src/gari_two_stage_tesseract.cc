@@ -291,6 +291,9 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   if (config_.top_candidates_per_trial == 0) {
     throw std::invalid_argument("GARI top candidate count must be positive.");
   }
+  if (config_.num_bottom_detector_orders == 0 || config_.num_bottom_detector_orders > 2) {
+    throw std::invalid_argument("GARI bottom detector-order count must be 1 or 2.");
+  }
   if (config_.max_top_beam >= INF_DET_BEAM || config_.bottom_beam >= INF_DET_BEAM) {
     throw std::invalid_argument("GARI two-stage beams must be below the infinity sentinel.");
   }
@@ -306,9 +309,16 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
 
   TesseractConfig bottom_config = child_config(bottom_dem_, config_);
   bottom_config.det_beam = config_.bottom_beam;
-  bottom_config.det_orders.resize(1);
-  bottom_config.det_orders[0].resize(layout.virtual_detector_count);
-  std::iota(bottom_config.det_orders[0].begin(), bottom_config.det_orders[0].end(), 0);
+  bottom_config.det_orders.resize(config_.num_bottom_detector_orders);
+  for (auto& order : bottom_config.det_orders) {
+    order.resize(layout.virtual_detector_count);
+    std::iota(order.begin(), order.end(), 0);
+  }
+  // Detector-index ordering has only two directions. Keep natural first so
+  // equal-cost ties preserve the original one-order result.
+  if (bottom_config.det_orders.size() == 2) {
+    std::reverse(bottom_config.det_orders[1].begin(), bottom_config.det_orders[1].end());
+  }
 
   top_decoder_ = std::make_unique<TesseractDecoder>(std::move(top_config));
   bottom_decoder_ = std::make_unique<TesseractDecoder>(std::move(bottom_config));
@@ -357,13 +367,21 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       ++result.bottom_cache_hits;
       outcome = cached->second;
     } else {
+      auto decode_bottom = [&]() {
+        // Preserve the original direct path when bottom diversity is disabled.
+        if (config_.num_bottom_detector_orders == 1) {
+          bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0, config_.bottom_beam);
+        } else {
+          bottom_decoder_->decode_to_errors(debt);
+        }
+      };
       if (config_.collect_bottom_timing) {
         const auto start = std::chrono::steady_clock::now();
-        bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0, config_.bottom_beam);
+        decode_bottom();
         result.bottom_decode_time_seconds +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
       } else {
-        bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0, config_.bottom_beam);
+        decode_bottom();
       }
 
       outcome.completed = !bottom_decoder_->low_confidence_flag;
