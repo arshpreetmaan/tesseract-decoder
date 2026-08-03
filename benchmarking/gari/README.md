@@ -47,6 +47,16 @@ that outer schedule. Set `--gari-top-candidates K` to retain up to `K`
 completed candidates from each top beam/order search before physical-cost
 reranking; its default is 1.
 
+Add `--gari-split-top` to decode the independent `D_X` and `D_Z` top blocks
+with separate Tesseract instances. The mapping JSON records each block's
+half-open detector-row, barred-column, and debt-row ranges as `offset` and
+`count`. Existing top orders are stably filtered into both blocks, so their
+method and seed are unchanged. With the split enabled, `--gari-top-candidates K`
+requests up to `K` candidates from each block and tests their within-trial
+Cartesian product (up to `K^2`) through the existing bottom debt cache.
+Mappings generated before `top_components` was added remain valid unless this
+flag is requested.
+
 Set `--gari-bottom-num-det-orders 2` to complete each new debt using both the
 natural and reversed bottom detector-index orders at the fixed
 `--gari-bottom-beam`, retaining the lower original physical cost. The default

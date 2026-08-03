@@ -98,6 +98,36 @@ GariTwoStageLayout parse_gari_two_stage_layout(const nlohmann::json& root,
     result.barred_error_to_virtual_detector.push_back(
         mappings[k].at("detector").get<size_t>());
   }
+
+  if (layout.contains("top_components")) {
+    const auto& top_components = layout.at("top_components");
+    if (top_components.at("index_space") != "monolithic_dem") {
+      throw std::invalid_argument("Unsupported GARI top-component index space");
+    }
+    auto read_range = [](const nlohmann::json& range) {
+      return GariBlockRange{
+          .offset = range.at("offset").get<size_t>(),
+          .count = range.at("count").get<size_t>(),
+      };
+    };
+    auto read_component = [&](const char* name) {
+      const auto& component = top_components.at(name);
+      return GariTopComponentLayout{
+          .detector_rows = read_range(component.at("detector_rows")),
+          .barred_error_columns = read_range(component.at("barred_error_columns")),
+          .debt_detector_rows = read_range(component.at("debt_detector_rows")),
+      };
+    };
+    result.top_components = GariTopComponentsLayout{
+        .d_x = read_component("d_x"),
+        .d_z = read_component("d_z"),
+    };
+    if (result.top_components->d_x.barred_error_columns.count != bar_e_z_count ||
+        result.top_components->d_z.barred_error_columns.count != bar_e_x_count) {
+      throw std::invalid_argument(
+          "GARI D_X/D_Z metadata disagrees with the barred-error blocks");
+    }
+  }
   return result;
 }
 
@@ -164,6 +194,7 @@ struct Args {
   std::string det_mapping_file;
   std::string custom_order;
   bool gari_two_stage = false;
+  bool gari_split_top = false;
   size_t gari_bottom_beam = 2;
   size_t gari_bottom_num_detector_orders = 1;
   size_t gari_top_candidates = 1;
@@ -293,6 +324,9 @@ struct Args {
       throw std::invalid_argument("Beam climbing requires a finite beam");
     }
 
+    if (gari_split_top && !gari_two_stage) {
+      throw std::invalid_argument("--gari-split-top requires --gari-two-stage");
+    }
     if (gari_two_stage) {
       if (dem_path.empty() || det_mapping_file.empty()) {
         throw std::invalid_argument(
@@ -364,6 +398,11 @@ struct Args {
       det_mapping = j.at("mapping").get<std::vector<uint64_t>>();
       if (gari_two_stage) {
         gari_two_stage_layout = parse_gari_two_stage_layout(j, dem_path);
+        if (gari_split_top && !gari_two_stage_layout.top_components.has_value()) {
+          throw std::invalid_argument(
+              "--gari-split-top requires a mapping containing "
+              "gari_two_stage.top_components; regenerate it with the current gari_dem_utils.py");
+        }
         if (gari_two_stage_layout.physical_detector_count != num_original_detectors) {
           throw std::invalid_argument(
               "GARI two-stage layout disagrees with the source detector count");
@@ -614,6 +653,10 @@ int main(int argc, char* argv[]) {
       .help("Split a GARI physical-logical mode-N DEM into top and bottom decoders")
       .flag()
       .store_into(args.gari_two_stage);
+  program.add_argument("--gari-split-top")
+      .help("Decode the independent GARI D_X and D_Z top blocks separately")
+      .flag()
+      .store_into(args.gari_split_top);
   program.add_argument("--gari-bottom-beam")
       .help("Fixed detector beam for each bottom GARI completion")
       .metavar("N")
@@ -625,7 +668,8 @@ int main(int argc, char* argv[]) {
       .default_value(size_t(1))
       .store_into(args.gari_bottom_num_detector_orders);
   program.add_argument("--gari-top-candidates")
-      .help("Maximum completed top candidates per GARI beam/order trial")
+      .help(
+          "Maximum completed candidates per top search (per block with --gari-split-top)")
       .metavar("N")
       .default_value(size_t(1))
       .store_into(args.gari_top_candidates);
@@ -860,9 +904,11 @@ int main(int argc, char* argv[]) {
   try {
     if (args.gari_two_stage) {
       gari_prepared_model =
-          prepare_gari_two_stage_model(original_dem, args.gari_two_stage_layout);
+          prepare_gari_two_stage_model(original_dem, args.gari_two_stage_layout,
+                                       args.gari_split_top);
       gari_config.max_top_beam = args.det_beam;
       gari_config.top_beam_climbing = args.beam_climbing;
+      gari_config.split_top = args.gari_split_top;
       gari_config.num_top_detector_orders = args.num_det_orders;
       gari_config.top_candidates_per_trial = args.gari_top_candidates;
       gari_config.top_detector_order_method = args.detector_order_method();
@@ -1062,6 +1108,7 @@ int main(int argc, char* argv[]) {
       stats_json["gari_two_stage"] = {
           {"bottom_beam", args.gari_bottom_beam},
           {"bottom_num_det_orders", args.gari_bottom_num_detector_orders},
+          {"split_top", args.gari_split_top},
           {"top_candidates_per_trial", args.gari_top_candidates},
           {"average_unique_top_candidates_per_shot",
            shot == 0 ? 0.0 : static_cast<double>(total_unique_debts) / shot},

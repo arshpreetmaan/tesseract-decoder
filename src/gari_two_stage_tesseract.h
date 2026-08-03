@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "stim.h"
@@ -14,12 +15,35 @@
 // Describes the block boundaries in a monolithic GARI DEM. Detector rows are
 // [physical, virtual], and error columns are [physical, barred]. Mapping values
 // use the monolithic detector indices, before virtual rows are rebased.
+struct GariBlockRange {
+  size_t offset = 0;
+  size_t count = 0;
+};
+
+struct GariTopComponentLayout {
+  GariBlockRange detector_rows;
+  GariBlockRange barred_error_columns;
+  GariBlockRange debt_detector_rows;
+};
+
+struct GariTopComponentsLayout {
+  GariTopComponentLayout d_x;
+  GariTopComponentLayout d_z;
+};
+
 struct GariTwoStageLayout {
   size_t physical_detector_count = 0;
   size_t virtual_detector_count = 0;
   size_t physical_error_count = 0;
   size_t barred_error_count = 0;
   std::vector<size_t> barred_error_to_virtual_detector;
+  std::optional<GariTopComponentsLayout> top_components;
+};
+
+struct GariPreparedTopComponent {
+  stim::DetectorErrorModel dem;
+  std::vector<size_t> error_to_top_error;
+  std::vector<std::vector<size_t>> error_detectors;
 };
 
 // Immutable result of validating and partitioning one monolithic GARI DEM.
@@ -31,14 +55,20 @@ struct GariTwoStagePreparedModel {
   std::vector<size_t> top_error_to_bottom_detector;
   std::vector<std::vector<size_t>> top_error_detectors;
   std::vector<std::vector<size_t>> bottom_error_detectors;
+
+  // Populated before workers when the direct-sum D_X/D_Z split is requested.
+  GariPreparedTopComponent d_x_top;
+  GariPreparedTopComponent d_z_top;
 };
 
 std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
-    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout);
+    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout,
+    bool prepare_top_components = false);
 
 struct GariTwoStageConfig {
   size_t max_top_beam = 20;
   bool top_beam_climbing = false;
+  bool split_top = false;
   size_t num_top_detector_orders = 21;
   size_t top_candidates_per_trial = 1;
   DetOrder top_detector_order_method = DetOrder::DetIndex;
@@ -73,9 +103,8 @@ struct GariTwoStageDecodeResult {
 };
 
 // Runs a fresh top search at every beam/order trial, then completes each top
-// candidate using the physical-error model. The two child decoders and their
-// graph data are retained across shots; the debt cache is intentionally per
-// shot.
+// candidate using the physical-error model. Child decoder graph data is
+// retained across shots; the debt cache is intentionally per shot.
 class GariTwoStageTesseractDecoder {
  public:
   GariTwoStageTesseractDecoder(
@@ -93,20 +122,30 @@ class GariTwoStageTesseractDecoder {
   const std::vector<std::vector<size_t>>& bottom_detector_orders() const {
     return bottom_decoder_->config.det_orders;
   }
+  const std::vector<std::vector<size_t>>& d_x_top_detector_orders() const {
+    return d_x_top_decoder_->config.det_orders;
+  }
+  const std::vector<std::vector<size_t>>& d_z_top_detector_orders() const {
+    return d_z_top_decoder_->config.det_orders;
+  }
   bool top_no_revisit_dets_enabled() const {
-    return top_decoder_->config.no_revisit_dets;
+    return active_top_decoder().config.no_revisit_dets;
   }
   bool bottom_no_revisit_dets_enabled() const {
     return bottom_decoder_->config.no_revisit_dets;
   }
   int top_sparsify_reactivate_limit() const {
-    return top_decoder_->config.sparsify_reactivate_limit;
+    return active_top_decoder().config.sparsify_reactivate_limit;
   }
 
  private:
+  const TesseractDecoder& active_top_decoder() const;
+
   std::shared_ptr<const GariTwoStagePreparedModel> prepared_model_;
   GariTwoStageConfig config_;
   std::unique_ptr<TesseractDecoder> top_decoder_;
+  std::unique_ptr<TesseractDecoder> d_x_top_decoder_;
+  std::unique_ptr<TesseractDecoder> d_z_top_decoder_;
   std::unique_ptr<TesseractDecoder> bottom_decoder_;
 };
 

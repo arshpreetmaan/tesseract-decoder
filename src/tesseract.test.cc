@@ -137,6 +137,68 @@ TEST(GariTwoStageTesseractTest, AdditionalTopCandidateImprovesPhysicalCost) {
   EXPECT_EQ(two_candidates.unique_debts, 2);
 }
 
+TEST(GariTwoStageTesseractTest, SplitTopCrossProductReranksPhysicalCost) {
+  stim::DetectorErrorModel dem(R"DEM(
+    error(0.01) D4
+    error(0.20) D5 L0
+    error(0.01) D6
+    error(0.20) D7 L1
+    error(0.20) D0 D4
+    error(0.10) D0 D5
+    error(0.20) D2 D6
+    error(0.10) D2 D7
+  )DEM");
+  GariTwoStageLayout layout = {
+      .physical_detector_count = 4,
+      .virtual_detector_count = 4,
+      .physical_error_count = 4,
+      .barred_error_count = 4,
+      .barred_error_to_virtual_detector = {4, 5, 6, 7},
+      .top_components = GariTopComponentsLayout{
+          .d_x = {
+              .detector_rows = {.offset = 0, .count = 2},
+              .barred_error_columns = {.offset = 4, .count = 2},
+              .debt_detector_rows = {.offset = 4, .count = 2},
+          },
+          .d_z = {
+              .detector_rows = {.offset = 2, .count = 2},
+              .barred_error_columns = {.offset = 6, .count = 2},
+              .debt_detector_rows = {.offset = 6, .count = 2},
+          },
+      },
+  };
+  auto prepared_model = prepare_gari_two_stage_model(dem, layout, true);
+  GariTwoStageConfig config;
+  config.split_top = true;
+  config.max_top_beam = 0;
+  config.num_top_detector_orders = 1;
+  config.top_detector_orders = {{3, 0, 2, 1}};
+  config.top_sparsify_errors = true;
+  config.top_sparsify_base_degree = 1;
+  config.bottom_beam = 0;
+
+  GariTwoStageTesseractDecoder one_candidate_decoder(prepared_model, config);
+  EXPECT_EQ(one_candidate_decoder.top_sparsify_reactivate_limit(), 0);
+  EXPECT_EQ(one_candidate_decoder.d_x_top_detector_orders(),
+            (std::vector<std::vector<size_t>>{{0, 1}}));
+  EXPECT_EQ(one_candidate_decoder.d_z_top_detector_orders(),
+            (std::vector<std::vector<size_t>>{{1, 0}}));
+  auto one_candidate = one_candidate_decoder.decode({0, 2});
+  ASSERT_TRUE(one_candidate.completed);
+  EXPECT_EQ(one_candidate.top_errors, (std::vector<size_t>{0, 2}));
+
+  config.top_candidates_per_trial = 2;
+  GariTwoStageTesseractDecoder decoder(prepared_model, config);
+  auto result = decoder.decode({0, 2});
+
+  ASSERT_TRUE(result.completed);
+  EXPECT_EQ(result.top_errors, (std::vector<size_t>{1, 3}));
+  EXPECT_EQ(result.physical_errors, (std::vector<size_t>{1, 3}));
+  EXPECT_EQ(result.observables, (std::vector<int>{0, 1}));
+  EXPECT_NEAR(result.physical_cost, -2 * std::log(0.20 / 0.80), EPSILON);
+  EXPECT_EQ(result.unique_debts, 4);
+}
+
 bool simplex_test_compare(stim::DetectorErrorModel& dem, std::vector<stim::SparseShot>& shots) {
   TesseractConfig tesseract_config{dem};
   TesseractDecoder tesseract_decoder(tesseract_config);

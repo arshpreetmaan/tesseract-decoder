@@ -30,6 +30,67 @@ struct BottomOutcome {
   std::vector<int> observables;
 };
 
+size_t checked_end(const GariBlockRange& range, const char* label) {
+  if (range.count > std::numeric_limits<size_t>::max() - range.offset) {
+    throw std::invalid_argument(std::string("GARI ") + label + " range overflows");
+  }
+  return range.offset + range.count;
+}
+
+void preserve_dem_dimensions(stim::DetectorErrorModel& dem, size_t detector_count,
+                             size_t observable_count = 0) {
+  if (dem.count_detectors() < detector_count) {
+    dem.append_detector_instruction(
+        {}, stim::DemTarget::relative_detector_id(detector_count - 1), "");
+  }
+  if (dem.count_observables() < observable_count) {
+    dem.append_logical_observable_instruction(
+        stim::DemTarget::observable_id(observable_count - 1), "");
+  }
+}
+
+void validate_partition(const GariBlockRange& first, const GariBlockRange& second,
+                        size_t expected_offset, size_t expected_count, const char* label) {
+  const size_t expected_end =
+      checked_end({.offset = expected_offset, .count = expected_count}, label);
+  if (first.offset != expected_offset || second.offset != checked_end(first, label) ||
+      checked_end(second, label) != expected_end) {
+    throw std::invalid_argument(std::string("GARI D_X/D_Z ") + label +
+                                " do not form a contiguous partition");
+  }
+}
+
+void validate_top_components(const GariTwoStageLayout& layout) {
+  if (!layout.top_components.has_value()) {
+    return;
+  }
+  const auto& components = *layout.top_components;
+  validate_partition(components.d_x.detector_rows, components.d_z.detector_rows, 0,
+                     layout.physical_detector_count, "detector rows");
+  validate_partition(components.d_x.barred_error_columns,
+                     components.d_z.barred_error_columns, layout.physical_error_count,
+                     layout.barred_error_count, "barred error columns");
+  validate_partition(components.d_x.debt_detector_rows,
+                     components.d_z.debt_detector_rows, layout.physical_detector_count,
+                     layout.virtual_detector_count, "debt detector rows");
+
+  for (const GariTopComponentLayout* component : {&components.d_x, &components.d_z}) {
+    if (component->barred_error_columns.count != component->debt_detector_rows.count) {
+      throw std::invalid_argument(
+          "Each GARI top component requires one debt detector per barred column");
+    }
+    const size_t first_top_error =
+        component->barred_error_columns.offset - layout.physical_error_count;
+    for (size_t k = 0; k < component->barred_error_columns.count; ++k) {
+      if (layout.barred_error_to_virtual_detector[first_top_error + k] !=
+          component->debt_detector_rows.offset + k) {
+        throw std::invalid_argument(
+            "GARI component debt rows disagree with the barred-error mapping");
+      }
+    }
+  }
+}
+
 void validate_layout(const stim::DetectorErrorModel& dem, const GariTwoStageLayout& layout) {
   if (layout.physical_detector_count == 0) {
     throw std::invalid_argument("GARI two-stage layout has no physical detectors.");
@@ -73,6 +134,7 @@ void validate_layout(const stim::DetectorErrorModel& dem, const GariTwoStageLayo
     }
     seen_virtual[local_detector] = true;
   }
+  validate_top_components(layout);
 }
 
 bool reproduces_syndrome(const std::vector<std::vector<size_t>>& error_detectors,
@@ -165,12 +227,52 @@ std::vector<std::vector<size_t>> build_top_orders(const stim::DetectorErrorModel
   return orders;
 }
 
+std::vector<std::vector<size_t>> filter_top_orders(
+    const std::vector<std::vector<size_t>>& top_orders, const GariBlockRange& detector_rows) {
+  std::vector<std::vector<size_t>> result(top_orders.size());
+  const size_t end = checked_end(detector_rows, "component detector");
+  for (size_t order_index = 0; order_index < top_orders.size(); ++order_index) {
+    auto& filtered = result[order_index];
+    filtered.reserve(detector_rows.count);
+    for (size_t detector : top_orders[order_index]) {
+      if (detector >= detector_rows.offset && detector < end) {
+        filtered.push_back(detector - detector_rows.offset);
+      }
+    }
+    if (filtered.size() != detector_rows.count) {
+      throw std::invalid_argument("GARI top order does not cover a complete D_X/D_Z component");
+    }
+  }
+  return result;
+}
+
+TesseractConfig top_child_config(const stim::DetectorErrorModel& dem,
+                                 const GariTwoStageConfig& config,
+                                 std::vector<std::vector<size_t>> detector_orders) {
+  TesseractConfig top = child_config(dem, config);
+  top.det_beam = config.max_top_beam;
+  top.no_revisit_dets = config.top_no_revisit_dets;
+  top.det_penalty = config.top_det_penalty;
+  top.sparsify_errors = config.top_sparsify_errors;
+  top.sparsify_base_degree = config.top_sparsify_base_degree;
+  top.sparsify_max_degree = config.top_sparsify_max_degree;
+  top.sparsify_reactivate_limit = config.top_sparsify_reactivate_limit;
+  top.det_orders = std::move(detector_orders);
+  return top;
+}
+
 }  // namespace
 
 std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
-    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout) {
+    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout,
+    bool prepare_top_components) {
   const stim::DetectorErrorModel flat_dem = gari_dem.flattened();
   validate_layout(flat_dem, layout);
+  if (prepare_top_components && !layout.top_components.has_value()) {
+    throw std::invalid_argument(
+        "--gari-split-top requires a mapping containing "
+        "gari_two_stage.top_components; regenerate it with the current gari_dem_utils.py");
+  }
   auto prepared = std::make_shared<GariTwoStagePreparedModel>();
   prepared->layout = layout;
   const size_t physical_detectors = layout.physical_detector_count;
@@ -266,6 +368,47 @@ std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
                                                  instruction.tag);
       prepared->top_error_to_bottom_detector.push_back(expected_virtual - physical_detectors);
       prepared->top_error_detectors.push_back(std::move(physical_targets));
+
+      if (prepare_top_components && layout.top_components.has_value()) {
+        const auto& components = *layout.top_components;
+        const GariTopComponentLayout* component = nullptr;
+        GariPreparedTopComponent* component_output = nullptr;
+        if (error_index < checked_end(components.d_x.barred_error_columns,
+                                      "D_X barred error")) {
+          component = &components.d_x;
+          component_output = &prepared->d_x_top;
+        } else {
+          component = &components.d_z;
+          component_output = &prepared->d_z_top;
+        }
+
+        const size_t detector_end =
+            checked_end(component->detector_rows, "component detector");
+        const size_t debt_end =
+            checked_end(component->debt_detector_rows, "component debt detector");
+        if (expected_virtual < component->debt_detector_rows.offset ||
+            expected_virtual >= debt_end) {
+          throw std::invalid_argument(
+              "A barred GARI error targets the other component's debt block");
+        }
+        std::vector<stim::DemTarget> component_targets;
+        std::vector<size_t> local_detectors;
+        component_targets.reserve(prepared->top_error_detectors.back().size());
+        local_detectors.reserve(prepared->top_error_detectors.back().size());
+        for (size_t detector : prepared->top_error_detectors.back()) {
+          if (detector < component->detector_rows.offset || detector >= detector_end) {
+            throw std::invalid_argument(
+                "A barred GARI error crosses between the D_X and D_Z top blocks");
+          }
+          const size_t local_detector = detector - component->detector_rows.offset;
+          component_targets.push_back(stim::DemTarget::relative_detector_id(local_detector));
+          local_detectors.push_back(local_detector);
+        }
+        component_output->dem.append_error_instruction(instruction.arg_data[0], component_targets,
+                                                       instruction.tag);
+        component_output->error_to_top_error.push_back(barred_error);
+        component_output->error_detectors.push_back(std::move(local_detectors));
+      }
     }
     ++error_index;
   }
@@ -275,6 +418,9 @@ std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
       prepared->bottom_dem.count_errors() != layout.physical_error_count) {
     throw std::invalid_argument("GARI DEM split did not preserve all configured errors.");
   }
+  preserve_dem_dimensions(prepared->top_dem, layout.physical_detector_count);
+  preserve_dem_dimensions(prepared->bottom_dem, layout.virtual_detector_count,
+                          gari_dem.count_observables());
   if (prepared->top_dem.count_detectors() != layout.physical_detector_count ||
       prepared->bottom_dem.count_detectors() != layout.virtual_detector_count) {
     throw std::invalid_argument("GARI child detector dimensions do not match the layout.");
@@ -283,6 +429,19 @@ std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
       prepared->bottom_dem.count_observables() != gari_dem.count_observables()) {
     throw std::invalid_argument(
         "GARI observables must occur on physical errors in the bottom model only.");
+  }
+  if (prepare_top_components && layout.top_components.has_value()) {
+    const auto& components = *layout.top_components;
+    preserve_dem_dimensions(prepared->d_x_top.dem, components.d_x.detector_rows.count);
+    preserve_dem_dimensions(prepared->d_z_top.dem, components.d_z.detector_rows.count);
+    if (prepared->d_x_top.dem.count_errors() !=
+            components.d_x.barred_error_columns.count ||
+        prepared->d_z_top.dem.count_errors() !=
+            components.d_z.barred_error_columns.count ||
+        prepared->d_x_top.dem.count_detectors() != components.d_x.detector_rows.count ||
+        prepared->d_z_top.dem.count_detectors() != components.d_z.detector_rows.count) {
+      throw std::invalid_argument("GARI D_X/D_Z child dimensions do not match the layout");
+    }
   }
   return prepared;
 }
@@ -307,15 +466,44 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   if (config_.max_top_beam >= INF_DET_BEAM || config_.bottom_beam >= INF_DET_BEAM) {
     throw std::invalid_argument("GARI two-stage beams must be below the infinity sentinel.");
   }
-  TesseractConfig top_config = child_config(prepared_model_->top_dem, config_);
-  top_config.det_beam = config_.max_top_beam;
-  top_config.no_revisit_dets = config_.top_no_revisit_dets;
-  top_config.det_penalty = config_.top_det_penalty;
-  top_config.sparsify_errors = config_.top_sparsify_errors;
-  top_config.sparsify_base_degree = config_.top_sparsify_base_degree;
-  top_config.sparsify_max_degree = config_.top_sparsify_max_degree;
-  top_config.sparsify_reactivate_limit = config_.top_sparsify_reactivate_limit;
-  top_config.det_orders = build_top_orders(prepared_model_->top_dem, config_);
+  if (config_.split_top && config_.top_sparsify_errors &&
+      config_.top_sparsify_reactivate_limit == -1) {
+    // Preserve one joint-top auto limit for both components and for the
+    // existing sparsify_reactivate_limit statistic.
+    const int error_count = static_cast<int>(std::min(
+        prepared_model_->top_dem.count_errors(),
+        static_cast<uint64_t>(std::numeric_limits<int>::max())));
+    config_.top_sparsify_reactivate_limit =
+        std::min(suggest_sparsify_reactivate_limit(
+                     prepared_model_->top_dem.count_detectors(),
+                     config_.top_sparsify_base_degree),
+                 error_count);
+  }
+  const auto top_orders = build_top_orders(prepared_model_->top_dem, config_);
+  if (config_.split_top) {
+    if (!layout.top_components.has_value()) {
+      throw std::invalid_argument(
+          "--gari-split-top requires a mapping containing "
+          "gari_two_stage.top_components; regenerate it with the current gari_dem_utils.py");
+    }
+    const auto& components = *layout.top_components;
+    if (prepared_model_->d_x_top.dem.count_errors() !=
+            components.d_x.barred_error_columns.count ||
+        prepared_model_->d_z_top.dem.count_errors() !=
+            components.d_z.barred_error_columns.count) {
+      throw std::invalid_argument(
+          "GARI D_X/D_Z components were not prepared before worker construction");
+    }
+    d_x_top_decoder_ = std::make_unique<TesseractDecoder>(top_child_config(
+        prepared_model_->d_x_top.dem, config_,
+        filter_top_orders(top_orders, components.d_x.detector_rows)));
+    d_z_top_decoder_ = std::make_unique<TesseractDecoder>(top_child_config(
+        prepared_model_->d_z_top.dem, config_,
+        filter_top_orders(top_orders, components.d_z.detector_rows)));
+  } else {
+    top_decoder_ = std::make_unique<TesseractDecoder>(
+        top_child_config(prepared_model_->top_dem, config_, top_orders));
+  }
 
   TesseractConfig bottom_config = child_config(prepared_model_->bottom_dem, config_);
   bottom_config.det_beam = config_.bottom_beam;
@@ -330,8 +518,11 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
     std::reverse(bottom_config.det_orders[1].begin(), bottom_config.det_orders[1].end());
   }
 
-  top_decoder_ = std::make_unique<TesseractDecoder>(std::move(top_config));
   bottom_decoder_ = std::make_unique<TesseractDecoder>(std::move(bottom_config));
+}
+
+const TesseractDecoder& GariTwoStageTesseractDecoder::active_top_decoder() const {
+  return config_.split_top ? *d_x_top_decoder_ : *top_decoder_;
 }
 
 GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
@@ -348,10 +539,25 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
     seen_detection[detector] = true;
   }
 
+  std::vector<uint64_t> d_x_detections;
+  std::vector<uint64_t> d_z_detections;
+  if (config_.split_top) {
+    const auto& components = *layout.top_components;
+    const size_t d_x_end = checked_end(components.d_x.detector_rows, "D_X detector");
+    for (uint64_t detector : top_detections) {
+      if (detector < d_x_end) {
+        d_x_detections.push_back(detector - components.d_x.detector_rows.offset);
+      } else {
+        d_z_detections.push_back(detector - components.d_z.detector_rows.offset);
+      }
+    }
+  }
+
   GariTwoStageDecodeResult result;
   std::unordered_map<std::vector<uint64_t>, BottomOutcome, VectorHash> bottom_cache;
-  auto consider_candidate = [&](const std::vector<size_t>& top_errors) {
-    if (!reproduces_syndrome(prepared_model_->top_error_detectors, top_errors, top_detections,
+  auto consider_candidate = [&](const std::vector<size_t>& top_errors, bool validate_top) {
+    if (validate_top &&
+        !reproduces_syndrome(prepared_model_->top_error_detectors, top_errors, top_detections,
                              layout.physical_detector_count)) {
       throw std::runtime_error("Completed top GARI candidate does not reproduce its syndrome.");
     }
@@ -416,7 +622,20 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       result.physical_errors = std::move(outcome.errors);
     }
   };
-  const size_t top_order_count = top_decoder_->config.det_orders.size();
+  auto combine_top_errors = [&](const std::vector<size_t>& d_x_errors,
+                                const std::vector<size_t>& d_z_errors) {
+    std::vector<size_t> top_errors;
+    top_errors.reserve(d_x_errors.size() + d_z_errors.size());
+    for (size_t error : d_x_errors) {
+      top_errors.push_back(prepared_model_->d_x_top.error_to_top_error.at(error));
+    }
+    for (size_t error : d_z_errors) {
+      top_errors.push_back(prepared_model_->d_z_top.error_to_top_error.at(error));
+    }
+    std::sort(top_errors.begin(), top_errors.end());
+    return top_errors;
+  };
+  const size_t top_order_count = active_top_decoder().config.det_orders.size();
 
   const size_t top_trial_count = config_.top_beam_climbing
                                      ? std::max(config_.max_top_beam + 1, top_order_count)
@@ -427,16 +646,56 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
                                 : config_.max_top_beam;
     const size_t top_detector_order = trial % top_order_count;
 
-    if (config_.top_candidates_per_trial == 1) {
-      top_decoder_->decode_to_errors(top_detections, top_detector_order, top_beam);
-      if (!top_decoder_->low_confidence_flag) {
-        consider_candidate(top_decoder_->predicted_errors_buffer);
+    if (config_.split_top) {
+      if (config_.top_candidates_per_trial == 1) {
+        d_x_top_decoder_->decode_to_errors(d_x_detections, top_detector_order, top_beam);
+        d_z_top_decoder_->decode_to_errors(d_z_detections, top_detector_order, top_beam);
+        if (d_x_top_decoder_->low_confidence_flag || d_z_top_decoder_->low_confidence_flag) {
+          continue;
+        }
+        consider_candidate(combine_top_errors(d_x_top_decoder_->predicted_errors_buffer,
+                                              d_z_top_decoder_->predicted_errors_buffer),
+                           true);
+        continue;
+      }
+
+      auto d_x_candidates = d_x_top_decoder_->decode_to_error_candidates(
+          d_x_detections, top_detector_order, top_beam, config_.top_candidates_per_trial);
+      auto d_z_candidates = d_z_top_decoder_->decode_to_error_candidates(
+          d_z_detections, top_detector_order, top_beam, config_.top_candidates_per_trial);
+      // The blocks are disjoint, so validating each component once validates
+      // every pair without repeating the full H_top check K^2 times.
+      for (const auto& candidate : d_x_candidates) {
+        if (!reproduces_syndrome(prepared_model_->d_x_top.error_detectors, candidate,
+                                 d_x_detections,
+                                 prepared_model_->d_x_top.dem.count_detectors())) {
+          throw std::runtime_error("Completed D_X candidate does not reproduce its syndrome");
+        }
+      }
+      for (const auto& candidate : d_z_candidates) {
+        if (!reproduces_syndrome(prepared_model_->d_z_top.error_detectors, candidate,
+                                 d_z_detections,
+                                 prepared_model_->d_z_top.dem.count_detectors())) {
+          throw std::runtime_error("Completed D_Z candidate does not reproduce its syndrome");
+        }
+      }
+      for (const auto& d_x_errors : d_x_candidates) {
+        for (const auto& d_z_errors : d_z_candidates) {
+          consider_candidate(combine_top_errors(d_x_errors, d_z_errors), false);
+        }
       }
     } else {
-      auto top_candidates = top_decoder_->decode_to_error_candidates(
-          top_detections, top_detector_order, top_beam, config_.top_candidates_per_trial);
-      for (const auto& top_errors : top_candidates) {
-        consider_candidate(top_errors);
+      if (config_.top_candidates_per_trial == 1) {
+        top_decoder_->decode_to_errors(top_detections, top_detector_order, top_beam);
+        if (!top_decoder_->low_confidence_flag) {
+          consider_candidate(top_decoder_->predicted_errors_buffer, true);
+        }
+      } else {
+        auto top_candidates = top_decoder_->decode_to_error_candidates(
+            top_detections, top_detector_order, top_beam, config_.top_candidates_per_trial);
+        for (const auto& top_errors : top_candidates) {
+          consider_candidate(top_errors, true);
+        }
       }
     }
   }

@@ -724,9 +724,18 @@ def get_two_stage_layout(gari_structure: dict, dem_file: str) -> dict:
     """Describes the fixed GARI block layout using full DEM indices."""
     nx = int(gari_structure["nx_virt"])
     nz = int(gari_structure["nz_virt"])
+    nx_real = int(gari_structure["nx_real"])
+    nz_real = int(gari_structure["nz_real"])
     ny = int(len(gari_structure["i_hy"]))
     physical_detectors = int(gari_structure["num_original_detectors"])
     virtual_detectors = nx + nz
+
+    if (
+        gari_structure["dx"].shape != (nx_real, nx)
+        or gari_structure["dz"].shape != (nz_real, nz)
+        or nx_real + nz_real != physical_detectors
+    ):
+        raise ValueError("D_X and D_Z dimensions do not partition the GARI top block")
 
     block_counts = {
         "e_z": nx,
@@ -785,6 +794,25 @@ def get_two_stage_layout(gari_structure: dict, dem_file: str) -> dict:
             "barred_count": barred_errors,
             "total_count": offset,
             "blocks": error_blocks,
+        },
+        "top_components": {
+            "index_space": "monolithic_dem",
+            "d_x": {
+                "detector_rows": {"offset": 0, "count": nx_real},
+                "barred_error_columns": {"offset": physical_errors, "count": nx},
+                "debt_detector_rows": {"offset": physical_detectors, "count": nx},
+            },
+            "d_z": {
+                "detector_rows": {"offset": nx_real, "count": nz_real},
+                "barred_error_columns": {
+                    "offset": physical_errors + nx,
+                    "count": nz,
+                },
+                "debt_detector_rows": {
+                    "offset": physical_detectors + nx,
+                    "count": nz,
+                },
+            },
         },
         "barred_error_to_virtual_detector": barred_to_virtual,
     }
