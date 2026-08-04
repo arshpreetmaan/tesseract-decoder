@@ -140,6 +140,101 @@ void validate_layout(const stim::DetectorErrorModel& dem, const GariTwoStageLayo
   validate_top_components(layout);
 }
 
+struct ValidatedGariError {
+  std::vector<size_t> physical_targets;
+  std::vector<size_t> virtual_targets;
+  std::vector<stim::DemTarget> top_targets;
+  std::vector<stim::DemTarget> bottom_targets;
+};
+
+template <typename OnError>
+void for_each_validated_gari_error(const stim::DetectorErrorModel& flat_dem,
+                                   const GariTwoStageLayout& layout, OnError&& on_error) {
+  const size_t physical_detectors = layout.physical_detector_count;
+  const size_t all_detectors = physical_detectors + layout.virtual_detector_count;
+  size_t error_index = 0;
+
+  for (const stim::DemInstruction& instruction : flat_dem.instructions) {
+    if (instruction.type != stim::DemInstructionType::DEM_ERROR) {
+      if (instruction.type == stim::DemInstructionType::DEM_DETECTOR ||
+          instruction.type == stim::DemInstructionType::DEM_LOGICAL_OBSERVABLE) {
+        continue;
+      }
+      throw std::invalid_argument("Unsupported instruction in flattened GARI DEM: " +
+                                  instruction.str());
+    }
+    if (instruction.arg_data.size() != 1 || !std::isfinite(instruction.arg_data[0]) ||
+        instruction.arg_data[0] <= 0 || instruction.arg_data[0] >= 1) {
+      throw std::invalid_argument(
+          "GARI error probabilities must be strictly between zero and one.");
+    }
+
+    ValidatedGariError error;
+    std::unordered_set<size_t> seen_detectors;
+    std::unordered_set<size_t> seen_observables;
+    for (const stim::DemTarget& target : instruction.target_data) {
+      if (target.is_relative_detector_id()) {
+        const size_t detector = target.val();
+        if (detector >= all_detectors || !seen_detectors.insert(detector).second) {
+          throw std::invalid_argument("Invalid or repeated detector target in GARI error " +
+                                      std::to_string(error_index) + ".");
+        }
+        if (detector < physical_detectors) {
+          error.physical_targets.push_back(detector);
+          error.top_targets.push_back(stim::DemTarget::relative_detector_id(detector));
+        } else {
+          error.virtual_targets.push_back(detector);
+          error.bottom_targets.push_back(
+              stim::DemTarget::relative_detector_id(detector - physical_detectors));
+        }
+      } else if (target.is_observable_id()) {
+        const size_t observable = target.val();
+        if (!seen_observables.insert(observable).second) {
+          throw std::invalid_argument("Repeated observable target in GARI error " +
+                                      std::to_string(error_index) + ".");
+        }
+        error.bottom_targets.push_back(target);
+      } else {
+        throw std::invalid_argument("Separator or unsupported target in GARI error " +
+                                    std::to_string(error_index) + ".");
+      }
+    }
+
+    if (error_index < layout.physical_error_count) {
+      if (!error.physical_targets.empty()) {
+        throw std::invalid_argument(
+            "A physical GARI error violates the bottom [I U; I V] block.");
+      }
+      if (error_index < layout.virtual_detector_count) {
+        if (error.virtual_targets.size() != 1 ||
+            error.virtual_targets[0] !=
+                layout.barred_error_to_virtual_detector[error_index]) {
+          throw std::invalid_argument(
+              "A physical identity-block error does not target its virtual detector.");
+        }
+      } else if (error.virtual_targets.size() != 2) {
+        throw std::invalid_argument(
+            "A physical Y error must target exactly two virtual detectors.");
+      }
+    } else {
+      const size_t barred_error = error_index - layout.physical_error_count;
+      const size_t expected_virtual =
+          layout.barred_error_to_virtual_detector[barred_error];
+      if (error.physical_targets.empty() || error.virtual_targets.size() != 1 ||
+          error.virtual_targets[0] != expected_virtual || !seen_observables.empty()) {
+        throw std::invalid_argument(
+            "A barred GARI error violates the top block or its debt identity.");
+      }
+    }
+    on_error(error_index, instruction, std::move(error));
+    ++error_index;
+  }
+
+  if (error_index != layout.physical_error_count + layout.barred_error_count) {
+    throw std::invalid_argument("GARI DEM validation did not preserve all configured errors.");
+  }
+}
+
 bool reproduces_syndrome(const std::vector<std::vector<size_t>>& error_detectors,
                          const std::vector<size_t>& selected_errors,
                          const std::vector<uint64_t>& expected_detections,
@@ -301,6 +396,15 @@ class GariTwoStageTesseractDecoder::BottomMatchingDecoder {
   pm::ExtendedMatchingResult scratch_;
 };
 
+void validate_gari_monolithic_one_way_model(
+    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout) {
+  const stim::DetectorErrorModel flat_dem = gari_dem.flattened();
+  validate_layout(flat_dem, layout);
+  for_each_validated_gari_error(
+      flat_dem, layout,
+      [](size_t, const stim::DemInstruction&, ValidatedGariError&&) {});
+}
+
 std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
     const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout,
     bool prepare_top_components) {
@@ -314,145 +418,77 @@ std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
   auto prepared = std::make_shared<GariTwoStagePreparedModel>();
   prepared->layout = layout;
   const size_t physical_detectors = layout.physical_detector_count;
-  const size_t all_detectors = physical_detectors + layout.virtual_detector_count;
 
   prepared->top_error_to_bottom_detector.reserve(layout.barred_error_count);
   prepared->top_error_detectors.reserve(layout.barred_error_count);
   prepared->bottom_error_detectors.reserve(layout.physical_error_count);
 
-  size_t error_index = 0;
-  for (const stim::DemInstruction& instruction : flat_dem.instructions) {
-    if (instruction.type != stim::DemInstructionType::DEM_ERROR) {
-      if (instruction.type == stim::DemInstructionType::DEM_DETECTOR ||
-          instruction.type == stim::DemInstructionType::DEM_LOGICAL_OBSERVABLE) {
-        continue;
-      }
-      throw std::invalid_argument("Unsupported instruction in flattened GARI DEM: " +
-                                  instruction.str());
-    }
-    if (instruction.arg_data.size() != 1 || !std::isfinite(instruction.arg_data[0]) ||
-        instruction.arg_data[0] <= 0 || instruction.arg_data[0] >= 1) {
-      throw std::invalid_argument(
-          "GARI error probabilities must be strictly between zero and one.");
-    }
-
-    std::vector<size_t> physical_targets;
-    std::vector<size_t> virtual_targets;
-    std::unordered_set<size_t> seen_detectors;
-    std::unordered_set<size_t> seen_observables;
-    std::vector<stim::DemTarget> top_targets;
-    std::vector<stim::DemTarget> bottom_targets;
-
-    for (const stim::DemTarget& target : instruction.target_data) {
-      if (target.is_relative_detector_id()) {
-        const size_t detector = target.val();
-        if (detector >= all_detectors || !seen_detectors.insert(detector).second) {
-          throw std::invalid_argument("Invalid or repeated detector target in GARI error " +
-                                      std::to_string(error_index) + ".");
-        }
-        if (detector < physical_detectors) {
-          physical_targets.push_back(detector);
-          top_targets.push_back(stim::DemTarget::relative_detector_id(detector));
-        } else {
-          virtual_targets.push_back(detector);
-          bottom_targets.push_back(
-              stim::DemTarget::relative_detector_id(detector - physical_detectors));
-        }
-      } else if (target.is_observable_id()) {
-        const size_t observable = target.val();
-        if (!seen_observables.insert(observable).second) {
-          throw std::invalid_argument("Repeated observable target in GARI error " +
-                                      std::to_string(error_index) + ".");
-        }
-        bottom_targets.push_back(target);
-      } else {
-        throw std::invalid_argument("Separator or unsupported target in GARI error " +
-                                    std::to_string(error_index) + ".");
-      }
-    }
-
-    if (error_index < layout.physical_error_count) {
-      if (!physical_targets.empty()) {
-        throw std::invalid_argument(
-            "A physical GARI error violates the bottom [I U; I V] block.");
-      }
-      if (error_index < layout.virtual_detector_count) {
-        if (virtual_targets.size() != 1 ||
-            virtual_targets[0] != layout.barred_error_to_virtual_detector[error_index]) {
-          throw std::invalid_argument(
-              "A physical identity-block error does not target its virtual detector.");
-        }
-      } else if (virtual_targets.size() != 2) {
-        throw std::invalid_argument(
-            "A physical Y error must target exactly two virtual detectors.");
-      }
-      prepared->bottom_dem.append_error_instruction(instruction.arg_data[0], bottom_targets,
-                                                     instruction.tag);
-      std::vector<size_t> local_targets;
-      local_targets.reserve(virtual_targets.size());
-      for (size_t detector : virtual_targets) {
-        local_targets.push_back(detector - physical_detectors);
-      }
-      prepared->bottom_error_detectors.push_back(std::move(local_targets));
-    } else {
-      const size_t barred_error = error_index - layout.physical_error_count;
-      const size_t expected_virtual = layout.barred_error_to_virtual_detector[barred_error];
-      if (physical_targets.empty() || virtual_targets.size() != 1 ||
-          virtual_targets[0] != expected_virtual || !seen_observables.empty()) {
-        throw std::invalid_argument(
-            "A barred GARI error violates the top block or its debt identity.");
-      }
-      prepared->top_dem.append_error_instruction(instruction.arg_data[0], top_targets,
-                                                 instruction.tag);
-      prepared->top_error_to_bottom_detector.push_back(expected_virtual - physical_detectors);
-      prepared->top_error_detectors.push_back(std::move(physical_targets));
-
-      if (prepare_top_components && layout.top_components.has_value()) {
-        const auto& components = *layout.top_components;
-        const GariTopComponentLayout* component = nullptr;
-        GariPreparedTopComponent* component_output = nullptr;
-        if (error_index < checked_end(components.d_x.barred_error_columns,
-                                      "D_X barred error")) {
-          component = &components.d_x;
-          component_output = &prepared->d_x_top;
-        } else {
-          component = &components.d_z;
-          component_output = &prepared->d_z_top;
-        }
-
-        const size_t detector_end =
-            checked_end(component->detector_rows, "component detector");
-        const size_t debt_end =
-            checked_end(component->debt_detector_rows, "component debt detector");
-        if (expected_virtual < component->debt_detector_rows.offset ||
-            expected_virtual >= debt_end) {
-          throw std::invalid_argument(
-              "A barred GARI error targets the other component's debt block");
-        }
-        std::vector<stim::DemTarget> component_targets;
-        std::vector<size_t> local_detectors;
-        component_targets.reserve(prepared->top_error_detectors.back().size());
-        local_detectors.reserve(prepared->top_error_detectors.back().size());
-        for (size_t detector : prepared->top_error_detectors.back()) {
-          if (detector < component->detector_rows.offset || detector >= detector_end) {
-            throw std::invalid_argument(
-                "A barred GARI error crosses between the D_X and D_Z top blocks");
+  for_each_validated_gari_error(
+      flat_dem, layout,
+      [&](size_t error_index, const stim::DemInstruction& instruction,
+          ValidatedGariError&& error) {
+        if (error_index < layout.physical_error_count) {
+          prepared->bottom_dem.append_error_instruction(
+              instruction.arg_data[0], error.bottom_targets, instruction.tag);
+          std::vector<size_t> local_targets;
+          local_targets.reserve(error.virtual_targets.size());
+          for (size_t detector : error.virtual_targets) {
+            local_targets.push_back(detector - physical_detectors);
           }
-          const size_t local_detector = detector - component->detector_rows.offset;
-          component_targets.push_back(stim::DemTarget::relative_detector_id(local_detector));
-          local_detectors.push_back(local_detector);
-        }
-        component_output->dem.append_error_instruction(instruction.arg_data[0], component_targets,
-                                                       instruction.tag);
-        component_output->error_to_top_error.push_back(barred_error);
-        component_output->error_detectors.push_back(std::move(local_detectors));
-      }
-    }
-    ++error_index;
-  }
+          prepared->bottom_error_detectors.push_back(std::move(local_targets));
+        } else {
+          const size_t barred_error = error_index - layout.physical_error_count;
+          const size_t expected_virtual =
+              layout.barred_error_to_virtual_detector[barred_error];
+          prepared->top_dem.append_error_instruction(
+              instruction.arg_data[0], error.top_targets, instruction.tag);
+          prepared->top_error_to_bottom_detector.push_back(expected_virtual - physical_detectors);
+          prepared->top_error_detectors.push_back(std::move(error.physical_targets));
 
-  if (error_index != layout.physical_error_count + layout.barred_error_count ||
-      prepared->top_dem.count_errors() != layout.barred_error_count ||
+          if (prepare_top_components && layout.top_components.has_value()) {
+            const auto& components = *layout.top_components;
+            const GariTopComponentLayout* component = nullptr;
+            GariPreparedTopComponent* component_output = nullptr;
+            if (error_index < checked_end(components.d_x.barred_error_columns,
+                                          "D_X barred error")) {
+              component = &components.d_x;
+              component_output = &prepared->d_x_top;
+            } else {
+              component = &components.d_z;
+              component_output = &prepared->d_z_top;
+            }
+
+            const size_t detector_end =
+                checked_end(component->detector_rows, "component detector");
+            const size_t debt_end =
+                checked_end(component->debt_detector_rows, "component debt detector");
+            if (expected_virtual < component->debt_detector_rows.offset ||
+                expected_virtual >= debt_end) {
+              throw std::invalid_argument(
+                  "A barred GARI error targets the other component's debt block");
+            }
+            std::vector<stim::DemTarget> component_targets;
+            std::vector<size_t> local_detectors;
+            component_targets.reserve(prepared->top_error_detectors.back().size());
+            local_detectors.reserve(prepared->top_error_detectors.back().size());
+            for (size_t detector : prepared->top_error_detectors.back()) {
+              if (detector < component->detector_rows.offset || detector >= detector_end) {
+                throw std::invalid_argument(
+                    "A barred GARI error crosses between the D_X and D_Z top blocks");
+              }
+              const size_t local_detector = detector - component->detector_rows.offset;
+              component_targets.push_back(stim::DemTarget::relative_detector_id(local_detector));
+              local_detectors.push_back(local_detector);
+            }
+            component_output->dem.append_error_instruction(
+                instruction.arg_data[0], component_targets, instruction.tag);
+            component_output->error_to_top_error.push_back(barred_error);
+            component_output->error_detectors.push_back(std::move(local_detectors));
+          }
+        }
+      });
+
+  if (prepared->top_dem.count_errors() != layout.barred_error_count ||
       prepared->bottom_dem.count_errors() != layout.physical_error_count) {
     throw std::invalid_argument("GARI DEM split did not preserve all configured errors.");
   }

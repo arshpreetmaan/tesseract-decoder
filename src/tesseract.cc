@@ -95,6 +95,9 @@ std::string TesseractConfig::str() {
   ss << "det_orders=" << config.det_orders << ", ";
   ss << "det_penalty=" << config.det_penalty << ", ";
   ss << "create_visualization=" << config.create_visualization;
+  if (config.gari_monolithic_one_way.has_value()) {
+    ss << ", gari_monolithic_one_way=true";
+  }
   ss << ")";
   return ss.str();
 }
@@ -115,6 +118,8 @@ std::string Node::str() {
 }
 
 bool Node::operator>(const Node& other) const {
+  // Keep total residual detectors as the equal-cost PQ tie-break. beam_dets is
+  // only the hard beam/minimum/visited-bucket measure.
   return cost > other.cost || (cost == other.cost && num_dets < other.num_dets);
 }
 
@@ -168,6 +173,44 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
   dem_error_to_error = std::move(dem_error_map);
   error_to_dem_error = common::invert_error_map(dem_error_to_error, config.dem.count_errors());
 
+  beam_detector_count = config.dem.count_detectors();
+  if (config.gari_monolithic_one_way.has_value()) {
+    gari_monolithic_one_way_enabled = true;
+    const auto& one_way = *config.gari_monolithic_one_way;
+    if (one_way.real_detector_count > config.dem.count_detectors()) {
+      throw std::invalid_argument(
+          "GARI real_detector_count cannot exceed the DEM detector count.");
+    }
+    if (one_way.physical_error_count > dem_error_to_error.size()) {
+      throw std::invalid_argument(
+          "GARI physical_error_count cannot exceed the original DEM error count.");
+    }
+    beam_detector_count = one_way.real_detector_count;
+
+    error_is_physical.resize(config.dem.count_errors());
+    for (size_t error_index = 0; error_index < error_to_dem_error.size(); ++error_index) {
+      size_t original_error_index = error_to_dem_error[error_index];
+      if (original_error_index == std::numeric_limits<size_t>::max()) {
+        throw std::runtime_error("A retained decoder error has no original DEM error mapping.");
+      }
+      error_is_physical[error_index] =
+          original_error_index < one_way.physical_error_count;
+    }
+    for (size_t original_error_index = 0; original_error_index < dem_error_to_error.size();
+         ++original_error_index) {
+      size_t error_index = dem_error_to_error[original_error_index];
+      if (error_index == std::numeric_limits<size_t>::max()) {
+        continue;
+      }
+      bool original_is_physical = original_error_index < one_way.physical_error_count;
+      if (error_is_physical[error_index] != original_is_physical) {
+        throw std::invalid_argument(
+            "GARI preprocessing merged physical and barred errors across the configured error "
+            "boundary.");
+      }
+    }
+  }
+
   if (config.det_orders.empty()) {
     config.det_orders.emplace_back(config.dem.count_detectors());
     std::iota(config.det_orders[0].begin(), config.det_orders[0].end(), 0);
@@ -179,10 +222,53 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
       }
     }
   }
+  if (config.gari_monolithic_one_way.has_value()) {
+    const size_t real_detector_count =
+        config.gari_monolithic_one_way->real_detector_count;
+    for (const auto& detector_order : config.det_orders) {
+      std::vector<uint8_t> real_seen(real_detector_count);
+      for (size_t i = 0; i < real_detector_count; ++i) {
+        size_t detector = detector_order[i];
+        if (detector >= real_detector_count || real_seen[detector]) {
+          throw std::invalid_argument(
+              "Each GARI monolithic one-way detector order must begin with every real detector "
+              "exactly once.");
+        }
+        real_seen[detector] = 1;
+      }
+      for (size_t i = real_detector_count; i < detector_order.size(); ++i) {
+        if (detector_order[i] != i) {
+          throw std::invalid_argument(
+              "Each GARI monolithic one-way detector order must end with virtual detectors in "
+              "natural order.");
+        }
+      }
+    }
+  }
   if (config.det_orders.empty()) {
     throw std::runtime_error("After initialization, detector orders list must not be empty.");
   }
   errors = get_errors_from_dem(config.dem.flattened());
+  if (gari_monolithic_one_way_enabled) {
+    for (size_t ei = 0; ei < errors.size(); ++ei) {
+      bool touches_real = false;
+      bool touches_virtual = false;
+      for (int detector : errors[ei].symptom.detectors) {
+        touches_real |= detector < beam_detector_count;
+        touches_virtual |= detector >= beam_detector_count;
+      }
+      if (error_is_physical[ei]) {
+        if (touches_real || !touches_virtual) {
+          throw std::invalid_argument(
+              "A physical GARI error must target virtual detectors only.");
+        }
+      } else if (!touches_real || !touches_virtual ||
+                 !errors[ei].symptom.observables.empty()) {
+        throw std::invalid_argument(
+            "A barred GARI error must connect real and virtual detectors without observables.");
+      }
+    }
+  }
   if (config.verbose) {
     for (auto& error : errors) {
       std::cout << error.str() << "\n";
@@ -203,11 +289,20 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
 void TesseractDecoder::initialize_structures(size_t num_detectors) {
   d2e.resize(num_detectors);
   edets.resize(num_errors);
+  if (gari_monolithic_one_way_enabled) {
+    beam_edets.resize(num_errors);
+  }
 
   for (size_t ei = 0; ei < num_errors; ++ei) {
     edets[ei] = errors[ei].symptom.detectors;
     for (int d : edets[ei]) {
-      d2e[d].push_back(ei);
+      if (!gari_monolithic_one_way_enabled || d < beam_detector_count ||
+          error_is_physical[ei]) {
+        d2e[d].push_back(ei);
+      }
+      if (gari_monolithic_one_way_enabled && d < beam_detector_count) {
+        beam_edets[ei].push_back(d);
+      }
     }
   }
 
@@ -276,7 +371,10 @@ void TesseractDecoder::initialize_structures(size_t num_detectors) {
     sparsify_optional_errors.clear();
     for (size_t ei = 0; ei < num_errors; ++ei) {
       int degree = errors[ei].symptom.detectors.size();
-      if (degree <= config.sparsify_base_degree) {
+      // Bottom columns never overlap the initial real-only syndrome, so retain
+      // all of them while sparsifying the barred/top portion of a one-way model.
+      if ((gari_monolithic_one_way_enabled && error_is_physical[ei]) ||
+          degree <= config.sparsify_base_degree) {
         sparsify_mandatory_errors.push_back(ei);
       } else if (degree > config.sparsify_base_degree &&
                  (config.sparsify_max_degree == -1 || degree <= config.sparsify_max_degree)) {
@@ -306,7 +404,7 @@ void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections)
     for (int trial = 0; trial < std::max(config.det_beam + 1, int(config.det_orders.size()));
          ++trial) {
       decode_to_errors_with_graph(detections, detector_order, beam, active_d2e);
-      double local_cost = cost_from_errors(predicted_errors_buffer);
+      double local_cost = solution_cost_from_errors(predicted_errors_buffer);
       if (!low_confidence_flag && local_cost < best_cost) {
         best_errors = predicted_errors_buffer;
         best_cost = local_cost;
@@ -325,7 +423,7 @@ void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections)
   } else {
     for (size_t detector_order = 0; detector_order < config.det_orders.size(); ++detector_order) {
       decode_to_errors_with_graph(detections, detector_order, config.det_beam, active_d2e);
-      double local_cost = cost_from_errors(predicted_errors_buffer);
+      double local_cost = solution_cost_from_errors(predicted_errors_buffer);
       if (!low_confidence_flag && local_cost < best_cost) {
         best_errors = predicted_errors_buffer;
         best_cost = local_cost;
@@ -415,6 +513,10 @@ void TesseractDecoder::decode_to_errors_with_graph(
           "Symptom " + std::to_string(d) +
           " references a detector >= num_detectors (= " + std::to_string(num_detectors) + ").");
     }
+    if (gari_monolithic_one_way_enabled && d >= beam_detector_count) {
+      throw std::invalid_argument(
+          "GARI monolithic one-way decoding accepts detections only on real detectors.");
+    }
     initial_detectors[d] = true;
     for (int ei : active_d2e[d]) {
       ++initial_detector_cost_tuples[ei].detectors_count;
@@ -431,20 +533,20 @@ void TesseractDecoder::decode_to_errors_with_graph(
     return;
   }
 
-  size_t min_num_dets = detections.size();
-  size_t max_num_dets = min_num_dets + detector_beam;
+  size_t min_beam_dets = detections.size();
+  size_t max_beam_dets = min_beam_dets + detector_beam;
 
   boost::dynamic_bitset<> next_detectors;
   std::vector<DetectorCostTuple> next_detector_cost_tuples;
 
-  pq.push({initial_cost, min_num_dets, 0, -1});
+  pq.push({initial_cost, detections.size(), min_beam_dets, 0, -1});
   size_t num_pq_pushed = 1;
 
   while (!pq.empty()) {
     const Node node = pq.top();
     pq.pop();
 
-    if (node.num_dets > max_num_dets) continue;
+    if (node.beam_dets > max_beam_dets) continue;
 
     boost::dynamic_bitset<> detectors = initial_detectors;
     std::vector<DetectorCostTuple> detector_cost_tuples(num_errors);
@@ -501,12 +603,12 @@ void TesseractDecoder::decode_to_errors_with_graph(
       if (candidates->size() >= max_candidates) {
         return;
       }
-      min_num_dets = 0;
-      max_num_dets = std::min(max_num_dets, detector_beam);
+      min_beam_dets = 0;
+      max_beam_dets = std::min(max_beam_dets, detector_beam);
       continue;
     }
 
-    if (config.no_revisit_dets && !visited_detectors[node.num_dets].insert(detectors).second)
+    if (config.no_revisit_dets && !visited_detectors[node.beam_dets].insert(detectors).second)
       continue;
 
     if (config.create_visualization) {
@@ -516,8 +618,14 @@ void TesseractDecoder::decode_to_errors_with_graph(
     if (config.verbose) {
       std::cout.precision(13);
       std::cout << "len(pq) = " << pq.size() << " num_pq_pushed = " << num_pq_pushed << std::endl;
-      std::cout << "num_dets = " << node.num_dets << " max_num_dets = " << max_num_dets
-                << " cost = " << node.cost << std::endl;
+      if (gari_monolithic_one_way_enabled) {
+        std::cout << "num_dets = " << node.num_dets << " beam_dets = " << node.beam_dets
+                  << " max_beam_dets = " << max_beam_dets << " cost = " << node.cost
+                  << std::endl;
+      } else {
+        std::cout << "num_dets = " << node.num_dets << " max_num_dets = " << max_beam_dets
+                  << " cost = " << node.cost << std::endl;
+      }
       std::cout << "activated_errors = ";
       int64_t walker_idx = node.error_chain_idx;
       while (walker_idx != -1) {
@@ -534,14 +642,14 @@ void TesseractDecoder::decode_to_errors_with_graph(
       std::cout << std::endl;
     }
 
-    if (node.num_dets < min_num_dets) {
-      min_num_dets = node.num_dets;
+    if (node.beam_dets < min_beam_dets) {
+      min_beam_dets = node.beam_dets;
       if (config.no_revisit_dets) {
-        for (size_t i = min_num_dets + detector_beam + 1; i <= max_num_dets; ++i) {
+        for (size_t i = min_beam_dets + detector_beam + 1; i <= max_beam_dets; ++i) {
           visited_detectors[i].clear();
         }
       }
-      max_num_dets = std::min(max_num_dets, min_num_dets + detector_beam);
+      max_beam_dets = std::min(max_beam_dets, min_beam_dets + detector_beam);
     }
 
     for (size_t d = 0; d < num_detectors; ++d) {
@@ -592,10 +700,18 @@ void TesseractDecoder::decode_to_errors_with_graph(
         }
       }
 
-      if (next_num_dets > max_num_dets) continue;
+      size_t next_beam_dets = next_num_dets;
+      if (gari_monolithic_one_way_enabled) {
+        next_beam_dets = node.beam_dets;
+        for (int d : beam_edets[ei]) {
+          next_beam_dets += next_detectors[d] ? 1 : -1;
+        }
+      }
 
-      if (config.no_revisit_dets && visited_detectors[next_num_dets].find(next_detectors) !=
-                                        visited_detectors[next_num_dets].end())
+      if (next_beam_dets > max_beam_dets) continue;
+
+      if (config.no_revisit_dets && visited_detectors[next_beam_dets].find(next_detectors) !=
+                                        visited_detectors[next_beam_dets].end())
         continue;
 
       for (int d : edets[ei]) {
@@ -627,7 +743,8 @@ void TesseractDecoder::decode_to_errors_with_graph(
       next_node.min_detector = min_detector;
       next_node.parent_idx = node.error_chain_idx;
 
-      pq.push({next_cost, next_num_dets, node.depth + 1, (int64_t)(error_chain_arena.size() - 1)});
+      pq.push({next_cost, next_num_dets, next_beam_dets, node.depth + 1,
+               (int64_t)(error_chain_arena.size() - 1)});
       ++num_pq_pushed;
 
       if (num_pq_pushed > config.pqlimit) {
@@ -660,6 +777,27 @@ double TesseractDecoder::cost_from_errors(const std::vector<size_t>& predicted_e
       throw std::invalid_argument("error index does not map to a retained decoder error");
     }
     total_cost += errors[error_index].likelihood_cost;
+  }
+  return total_cost;
+}
+
+double TesseractDecoder::solution_cost_from_errors(
+    const std::vector<size_t>& predicted_errors) const {
+  if (!config.gari_monolithic_one_way.has_value()) {
+    return cost_from_errors(predicted_errors);
+  }
+
+  double total_cost = 0;
+  const size_t physical_error_count =
+      config.gari_monolithic_one_way->physical_error_count;
+  for (size_t dem_error_index : predicted_errors) {
+    size_t error_index = dem_error_to_error.at(dem_error_index);
+    if (error_index == std::numeric_limits<size_t>::max()) {
+      throw std::invalid_argument("error index does not map to a retained decoder error");
+    }
+    if (dem_error_index < physical_error_count) {
+      total_cost += errors[error_index].likelihood_cost;
+    }
   }
   return total_cost;
 }

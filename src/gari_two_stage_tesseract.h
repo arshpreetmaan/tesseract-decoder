@@ -61,6 +61,11 @@ struct GariTwoStagePreparedModel {
   GariPreparedTopComponent d_z_top;
 };
 
+// Validates the flattened monolithic GARI block structure used by the
+// one-way search. This performs no decoder construction or DEM partitioning.
+void validate_gari_monolithic_one_way_model(
+    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout);
+
 std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
     const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout,
     bool prepare_top_components = false);

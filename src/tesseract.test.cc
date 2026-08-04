@@ -225,6 +225,56 @@ TEST(GariTwoStageTesseractTest, SplitTopCrossProductReranksPhysicalCost) {
   EXPECT_EQ(result.unique_debts, 4);
 }
 
+TEST(GariMonolithicOneWayTest, CarriesDebtThroughARealOnlyBeam) {
+  stim::DetectorErrorModel dem(R"DEM(
+    error(0.1) D2 L0
+    error(0.2) D3 L1
+    error(0.01) D2 D3 L2
+    error(0.1) D0 D1 D2
+    error(0.2) D1 D3
+  )DEM");
+  GariTwoStageLayout layout = {
+      .physical_detector_count = 2,
+      .virtual_detector_count = 2,
+      .physical_error_count = 3,
+      .barred_error_count = 2,
+      .barred_error_to_virtual_detector = {2, 3},
+  };
+  validate_gari_monolithic_one_way_model(dem, layout);
+
+  TesseractConfig config{dem};
+  config.det_beam = 0;
+  config.det_orders = {{0, 1, 2, 3}};
+  config.merge_errors = false;
+  config.no_revisit_dets = true;
+  config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
+      .real_detector_count = 2,
+      .physical_error_count = 3,
+  };
+  TesseractDecoder decoder(config);
+
+  EXPECT_EQ(decoder.d2e[2], (std::vector<int>{0, 2}));
+  EXPECT_EQ(decoder.d2e[3], (std::vector<int>{1, 2}));
+  decoder.decode_to_errors({0});
+
+  ASSERT_FALSE(decoder.low_confidence_flag);
+  std::sort(decoder.predicted_errors_buffer.begin(), decoder.predicted_errors_buffer.end());
+  EXPECT_EQ(decoder.predicted_errors_buffer, (std::vector<size_t>{0, 1, 3, 4}));
+  EXPECT_EQ(decoder.get_flipped_observables(decoder.predicted_errors_buffer),
+            (std::vector<int>{0, 1}));
+  const double physical_cost = -std::log(0.1 / 0.9) - std::log(0.2 / 0.8);
+  EXPECT_NEAR(decoder.solution_cost_from_errors(decoder.predicted_errors_buffer), physical_cost,
+              EPSILON);
+  EXPECT_NEAR(decoder.cost_from_errors(decoder.predicted_errors_buffer), 2 * physical_cost,
+              EPSILON);
+
+  config.sparsify_errors = true;
+  config.sparsify_base_degree = 1;
+  config.sparsify_reactivate_limit = 0;
+  TesseractDecoder sparse_decoder(config);
+  EXPECT_EQ(sparse_decoder.sparsify_mandatory_errors, (std::vector<int>{0, 1, 2}));
+}
+
 bool simplex_test_compare(stim::DetectorErrorModel& dem, std::vector<stim::SparseShot>& shots) {
   TesseractConfig tesseract_config{dem};
   TesseractDecoder tesseract_decoder(tesseract_config);

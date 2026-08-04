@@ -17,6 +17,7 @@
 
 #include <boost/dynamic_bitset.hpp>
 #include <cstdint>
+#include <optional>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -33,6 +34,11 @@ constexpr int DEFAULT_DET_BEAM = 5;
 constexpr size_t DEFAULT_PQLIMIT = 200000;
 
 int suggest_sparsify_reactivate_limit(size_t num_detectors, int sparsify_base_degree);
+
+struct GariMonolithicOneWayConfig {
+  size_t real_detector_count = 0;
+  size_t physical_error_count = 0;
+};
 
 struct TesseractConfig {
   stim::DetectorErrorModel dem;
@@ -52,6 +58,8 @@ struct TesseractConfig {
   int sparsify_max_degree = -1;
   int sparsify_reactivate_limit = -1;
 
+  std::optional<GariMonolithicOneWayConfig> gari_monolithic_one_way;
+
   std::string str();
 };
 
@@ -60,6 +68,9 @@ class Node {
   double cost;
   // The number of activated detectors (dets for short) at this node
   size_t num_dets;
+  // The number of activated detectors used by the beam cutoff. This is equal
+  // to num_dets normally, but excludes virtual GARI detectors in one-way mode.
+  size_t beam_dets;
   size_t depth;
   int64_t error_chain_idx = -1;
 
@@ -107,6 +118,10 @@ struct TesseractDecoder {
   // flattened DEM error indices.
   double cost_from_errors(const std::vector<size_t>& predicted_errors) const;
 
+  // Returns the cost used to choose among completed detector-order/beam searches. This is the full
+  // likelihood cost normally, and the original physical-error cost in GARI monolithic one-way mode.
+  double solution_cost_from_errors(const std::vector<size_t>& predicted_errors) const;
+
   std::vector<int> decode(const std::vector<uint64_t>& detections);
   void decode_shots(std::vector<stim::SparseShot>& shots,
                     std::vector<std::vector<int>>& obs_predicted);
@@ -146,6 +161,10 @@ struct TesseractDecoder {
 
  private:
   std::vector<uint64_t> sparse_d2e_detections;
+  std::vector<uint8_t> error_is_physical;
+  std::vector<std::vector<int>> beam_edets;
+  size_t beam_detector_count = 0;
+  bool gari_monolithic_one_way_enabled = false;
   int sparse_d2e_reactivate_limit = -1;
   bool sparse_d2e_valid = false;
 

@@ -14,9 +14,9 @@
 bazel build --jobs=1 src:tesseract
 ```
 
-For two-stage decoding, generate only the required physical-logical mode-N DEM
-and compact mapping JSON. The input can be one `.stim` file or a directory,
-which is scanned recursively:
+For two-stage or monolithic one-way decoding, generate the required
+physical-logical mode-N DEM and compact mapping JSON. The input can be one
+`.stim` file or a directory, which is scanned recursively:
 
 ```bash
 bazel run --jobs=1 //src/py/_tesseract_py_util:gari_dem_utils -- \
@@ -26,7 +26,7 @@ bazel run --jobs=1 //src/py/_tesseract_py_util:gari_dem_utils -- \
 This writes or updates only `<circuit-directory>/gari/<stem>_ogL_modeN.dem` and
 `<circuit-directory>/gari/<stem>_two_stage_mapping.json`; existing generated
 artifacts are left untouched. The compact JSON omits the legacy custom detector
-orders; two-stage top orders are generated in memory by Tesseract.
+orders; both modes generate their real-detector orders in memory.
 
 A fixed beam with one top order performs one top-and-bottom pass:
 
@@ -41,7 +41,36 @@ A fixed beam with one top order performs one top-and-bottom pass:
   --stats-out "<fixed-stats>.json"
 ```
 
-Add `--beam-climbing` to test beams 0 through 20. Set
+For a single constrained search over the full GARI model, use the mapped
+`_ogL_modeN.dem` with `--gari-monolithic-one-way` instead of
+`--gari-two-stage`:
+
+```bash
+./bazel-bin/src/tesseract \
+  --gari-monolithic-one-way --circuit "<circuit>.stim" \
+  --dem "<gari>/<stem>_ogL_modeN.dem" \
+  --det-mapping-file "<gari>/<stem>_two_stage_mapping.json" \
+  --sample-num-shots 10 --sample-seed 0 --threads 1 \
+  --beam 5 --num-det-orders 16 --det-order-bfs \
+  --pqlimit 1000000 --stats-out "<one-way-stats>.json"
+```
+
+This mode uses the normal monolithic Tesseract decoder, with one priority
+queue, error chain, and beam per detector-order trial. Each order contains a
+varied real-detector prefix followed by the same natural virtual-detector
+suffix. Barred columns remain selectable from real pivots and create their
+virtual identity debt, but virtual pivots expose physical columns only. The
+beam counts active real detectors, so accumulated debt does not by itself
+prune a top branch; debt repayment still contributes to queue priority.
+Completed trials are compared using original physical-error cost only, and
+the `_ogL` layout makes observables physical-only. The standard
+`--beam-climbing`, `--no-revisit-dets`, ordering, sparsification, and queue-limit
+options remain available. One-way sparsification retains every physical column
+and sparsifies only eligible barred columns. The `gari_monolithic_one_way` statistics block
+records the layout sizes, real and virtual ordering policies, and the
+real-detector/physical-error scopes.
+
+For two-stage decoding, add `--beam-climbing` to test beams 0 through 20. Set
 `--num-det-orders 21` to cycle through 21 randomized top index orders during
 that outer schedule. Set `--gari-top-candidates K` to retain up to `K`
 completed candidates from each top beam/order search before physical-cost

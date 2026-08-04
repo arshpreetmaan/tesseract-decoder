@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <queue>
+#include <random>
 #include <thread>
 #include <utility>
 
@@ -155,6 +156,42 @@ std::vector<std::vector<size_t>> map_source_orders_to_top(
   return result;
 }
 
+std::vector<std::vector<size_t>> build_mapped_index_orders(
+    const std::vector<uint64_t>& source_to_real, size_t num_orders, uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<int> reverse_order(0, 1);
+  std::vector<std::vector<size_t>> orders(num_orders);
+  for (auto& order : orders) {
+    order.assign(source_to_real.begin(), source_to_real.end());
+    if (reverse_order(rng)) {
+      std::reverse(order.begin(), order.end());
+    }
+  }
+  return orders;
+}
+
+std::vector<std::vector<size_t>> append_natural_virtual_suffix(
+    std::vector<std::vector<size_t>> real_orders, size_t real_detectors,
+    size_t virtual_detectors) {
+  for (auto& order : real_orders) {
+    if (order.size() != real_detectors) {
+      throw std::invalid_argument("GARI real detector order has the wrong size");
+    }
+    std::vector<bool> seen(real_detectors);
+    for (size_t detector : order) {
+      if (detector >= real_detectors || seen[detector]) {
+        throw std::invalid_argument("GARI real detector order must be a permutation");
+      }
+      seen[detector] = true;
+    }
+    order.reserve(real_detectors + virtual_detectors);
+    for (size_t detector = 0; detector < virtual_detectors; ++detector) {
+      order.push_back(real_detectors + detector);
+    }
+  }
+  return real_orders;
+}
+
 std::vector<std::vector<size_t>> filter_custom_orders_to_top(
     const std::vector<std::vector<size_t>>& gari_orders, size_t physical_detectors,
     size_t total_detectors) {
@@ -194,6 +231,7 @@ struct Args {
   std::string det_mapping_file;
   std::string custom_order;
   bool gari_two_stage = false;
+  bool gari_monolithic_one_way = false;
   bool gari_split_top = false;
   std::string gari_bottom_decoder = "tesseract";
   size_t gari_bottom_beam = 2;
@@ -268,6 +306,13 @@ struct Args {
     return DetOrder::DetIndex;
   }
 
+  std::string detector_order_method_name() const {
+    if (!custom_order.empty()) return "custom";
+    if (det_order_bfs) return "bfs";
+    if (det_order_coordinate) return "coordinate";
+    return "index";
+  }
+
   GariBottomBackend gari_bottom_backend() const {
     return gari_bottom_decoder == "pymatching" ? GariBottomBackend::PyMatching
                                                 : GariBottomBackend::Tesseract;
@@ -330,6 +375,10 @@ struct Args {
       throw std::invalid_argument("Beam climbing requires a finite beam");
     }
 
+    if (gari_two_stage && gari_monolithic_one_way) {
+      throw std::invalid_argument(
+          "--gari-two-stage and --gari-monolithic-one-way are mutually exclusive");
+    }
     if (gari_split_top && !gari_two_stage) {
       throw std::invalid_argument("--gari-split-top requires --gari-two-stage");
     }
@@ -337,7 +386,8 @@ struct Args {
       throw std::invalid_argument(
           "--gari-bottom-decoder must be 'tesseract' or 'pymatching'");
     }
-    if (!gari_two_stage && program.is_used("--gari-bottom-decoder")) {
+    if (!gari_two_stage && !gari_monolithic_one_way &&
+        program.is_used("--gari-bottom-decoder")) {
       throw std::invalid_argument("--gari-bottom-decoder requires --gari-two-stage");
     }
     if (gari_two_stage) {
@@ -375,6 +425,23 @@ struct Args {
               "--dem-out is unavailable with --gari-bottom-decoder pymatching because "
               "matching returns observables and cost, not physical error indices");
         }
+      }
+    }
+    if (gari_monolithic_one_way) {
+      if (dem_path.empty() || det_mapping_file.empty()) {
+        throw std::invalid_argument(
+            "--gari-monolithic-one-way requires --dem and --det-mapping-file");
+      }
+      if (num_det_orders == 0) {
+        throw std::invalid_argument("--num-det-orders must be at least 1");
+      }
+      if (program.is_used("--gari-bottom-decoder") ||
+          program.is_used("--gari-bottom-beam") ||
+          program.is_used("--gari-bottom-num-det-orders") ||
+          program.is_used("--gari-top-candidates")) {
+        throw std::invalid_argument(
+            "GARI two-stage bottom and candidate options cannot be used with "
+            "--gari-monolithic-one-way");
       }
     }
 
@@ -421,7 +488,7 @@ struct Args {
       nlohmann::json j = nlohmann::json::parse(f);
       num_original_detectors = j.at("num_original_detectors").get<uint64_t>();
       det_mapping = j.at("mapping").get<std::vector<uint64_t>>();
-      if (gari_two_stage) {
+      if (gari_two_stage || gari_monolithic_one_way) {
         gari_two_stage_layout = parse_gari_two_stage_layout(j, dem_path);
         if (gari_split_top && !gari_two_stage_layout.top_components.has_value()) {
           throw std::invalid_argument(
@@ -458,7 +525,8 @@ struct Args {
             throw std::invalid_argument("Mapping file does not contain custom order: " + custom_order);
           }
         }
-      } else if (!custom_order.empty() && gari_two_stage) {
+      } else if (!custom_order.empty() &&
+                 (gari_two_stage || gari_monolithic_one_way)) {
         throw std::invalid_argument(
             "--custom-order requires a mapping JSON containing det_orders");
       }
@@ -506,6 +574,14 @@ struct Args {
 
     config.merge_errors = !no_merge_errors;
 
+    if (gari_monolithic_one_way) {
+      validate_gari_monolithic_one_way_model(config.dem, gari_two_stage_layout);
+      config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
+          .real_detector_count = gari_two_stage_layout.physical_detector_count,
+          .physical_error_count = gari_two_stage_layout.physical_error_count,
+      };
+    }
+
     // Sample orientations of the error model to use for the det priority
     {
       if (verbose) {
@@ -537,6 +613,29 @@ struct Args {
           gari_top_detector_orders = map_source_orders_to_top(source_orders, det_mapping);
         }
         config.det_orders.clear();
+      } else if (gari_monolithic_one_way) {
+        std::vector<std::vector<size_t>> real_orders;
+        if (!custom_det_orders.empty()) {
+          real_orders = filter_custom_orders_to_top(
+              custom_det_orders, gari_two_stage_layout.physical_detector_count,
+              gari_two_stage_layout.physical_detector_count +
+                  gari_two_stage_layout.virtual_detector_count);
+          num_det_orders = real_orders.size();
+        } else if (detector_order_method() == DetOrder::DetIndex) {
+          real_orders = build_mapped_index_orders(det_mapping, num_det_orders,
+                                                  det_order_seed);
+        } else {
+          if (circuit_path.empty()) {
+            throw std::invalid_argument(
+                "GARI BFS/coordinate detector orders require --circuit");
+          }
+          auto source_orders = build_det_orders(make_source_dem(), num_det_orders,
+                                                detector_order_method(), det_order_seed);
+          real_orders = map_source_orders_to_top(source_orders, det_mapping);
+        }
+        config.det_orders = append_natural_virtual_suffix(
+            std::move(real_orders), gari_two_stage_layout.physical_detector_count,
+            gari_two_stage_layout.virtual_detector_count);
       } else if (!custom_det_orders.empty()) {
         for (const auto& order : custom_det_orders) {
           if (order.size() != config.dem.count_detectors()) {
@@ -671,13 +770,19 @@ int main(int argc, char* argv[]) {
   program.add_argument("--custom-order")
       .help(
           "Specific detector order from a full mapping JSON (for example, 'order5' or 'all'); "
-          "two-stage mode filters it to the top")
+          "mapped GARI modes filter it to the real detectors")
       .default_value(std::string(""))
       .store_into(args.custom_order);
   program.add_argument("--gari-two-stage")
       .help("Split a GARI physical-logical mode-N DEM into top and bottom decoders")
       .flag()
       .store_into(args.gari_two_stage);
+  program.add_argument("--gari-monolithic-one-way")
+      .help(
+          "Use one monolithic GARI search with real detectors first and prohibit "
+          "barred errors at virtual pivots")
+      .flag()
+      .store_into(args.gari_monolithic_one_way);
   program.add_argument("--gari-split-top")
       .help("Decode the independent GARI D_X and D_Z top blocks separately")
       .flag()
@@ -708,12 +813,13 @@ int main(int argc, char* argv[]) {
           "If provided, will not merge identical error mechanisms (two-stage children never merge)")
       .store_into(args.no_merge_errors);
   program.add_argument("--num-det-orders")
-      .help("Number of detector orders (top detector orders in GARI two-stage mode)")
+      .help("Number of detector orders (real-detector orders in mapped GARI modes)")
       .metavar("N")
       .default_value(size_t(1))
       .store_into(args.num_det_orders);
   program.add_argument("--det-order-bfs")
-      .help("Use BFS-based detector ordering (mapped from the source circuit in two-stage mode)")
+      .help(
+          "Use BFS-based detector ordering (mapped from the source circuit in mapped GARI modes)")
       .flag()
       .store_into(args.det_order_bfs);
   program.add_argument("--det-order-index")
@@ -725,7 +831,7 @@ int main(int argc, char* argv[]) {
   program.add_argument("--det-order-coordinate")
       .help(
           "Random geometric detector orientation ordering (mapped from the source circuit in "
-          "two-stage mode)")
+          "mapped GARI modes)")
       .flag()
       .store_into(args.det_order_coordinate);
   program.add_argument("--det-order-seed")
@@ -835,7 +941,8 @@ int main(int argc, char* argv[]) {
       .store_into(args.num_threads);
   program.add_argument("--beam")
       .help(
-          "Fixed beam, or maximum beam with climbing (default infinity; two-stage default 20)")
+          "Fixed beam, or maximum beam with climbing (default infinity; two-stage default 20; "
+          "one-way GARI counts real detectors only)")
       .metavar("N")
       .default_value(INF_DET_BEAM)
       .store_into(args.det_beam);
@@ -847,12 +954,15 @@ int main(int argc, char* argv[]) {
       .default_value(0.0)
       .store_into(args.det_penalty);
   program.add_argument("--beam-climbing")
-      .help("Use beam climbing (controls the outer top schedule in GARI two-stage mode)")
+      .help(
+          "Use beam climbing (controls the outer top schedule in two-stage mode and the ordinary "
+          "monolithic schedule in one-way mode)")
       .flag()
       .store_into(args.beam_climbing);
   program.add_argument("--no-revisit-dets")
       .help(
-          "Use no-revisit-dets heuristic (applies only to the top child in GARI two-stage mode)")
+          "Use no-revisit-dets heuristic (top child only in two-stage mode; full state in "
+          "one-way mode)")
       .flag()
       .store_into(args.no_revisit_dets);
 
@@ -875,7 +985,9 @@ int main(int argc, char* argv[]) {
       .store_into(args.print_stats);
 
   program.add_argument("--sparsify-errors")
-      .help("Enables per-shot sparse error activation (top child only in GARI two-stage mode).")
+      .help(
+          "Enables per-shot sparse error activation (top child only in two-stage mode; "
+          "barred columns only in one-way mode).")
       .flag()
       .store_into(args.sparsify_errors);
   program.add_argument("--sparsify-base-degree")
@@ -1027,7 +1139,8 @@ int main(int argc, char* argv[]) {
             obs_predicted[shot_index][observable] ^= 1;
           }
           low_confidence[shot_index] = decoder.low_confidence_flag;
-          cost_predicted[shot_index] = decoder.cost_from_errors(decoder.predicted_errors_buffer);
+          cost_predicted[shot_index] =
+              decoder.solution_cost_from_errors(decoder.predicted_errors_buffer);
           if (!has_obs || shots[shot_index].obs_mask == obs_predicted[shot_index]) {
             for (size_t ei : decoder.predicted_errors_buffer) {
               ++error_use[ei];
@@ -1153,6 +1266,18 @@ int main(int argc, char* argv[]) {
            total_time_seconds <= 0
                ? 0.0
                : std::clamp(bottom_decode_time_seconds / total_time_seconds, 0.0, 1.0)},
+      };
+    }
+    if (args.gari_monolithic_one_way) {
+      stats_json["gari_monolithic_one_way"] = {
+          {"real_detector_count", args.gari_two_stage_layout.physical_detector_count},
+          {"virtual_detector_count", args.gari_two_stage_layout.virtual_detector_count},
+          {"physical_error_count", args.gari_two_stage_layout.physical_error_count},
+          {"barred_error_count", args.gari_two_stage_layout.barred_error_count},
+          {"real_detector_order_method", args.detector_order_method_name()},
+          {"virtual_detector_order", "natural"},
+          {"beam_scope", "real_detectors"},
+          {"final_cost_scope", "physical_errors"},
       };
     }
 
