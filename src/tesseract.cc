@@ -97,6 +97,10 @@ std::string TesseractConfig::str() {
   ss << "create_visualization=" << config.create_visualization;
   if (config.gari_monolithic_one_way.has_value()) {
     ss << ", gari_monolithic_one_way=true";
+    if (config.gari_monolithic_one_way->bottom_beam < INF_DET_BEAM) {
+      ss << ", gari_monolithic_bottom_beam="
+         << config.gari_monolithic_one_way->bottom_beam;
+    }
   }
   ss << ")";
   return ss.str();
@@ -504,6 +508,21 @@ void TesseractDecoder::decode_to_errors_with_graph(
     error_chain_arena.reserve(config.pqlimit);
   }
 
+  constexpr uint32_t NO_BOTTOM_CONTEXT = std::numeric_limits<uint32_t>::max();
+  const size_t bottom_beam = gari_monolithic_one_way_enabled
+                                 ? config.gari_monolithic_one_way->bottom_beam
+                                 : INF_DET_BEAM;
+  const bool bottom_beam_enabled = bottom_beam < INF_DET_BEAM;
+  struct BottomBeamContext {
+    size_t min_virtual_dets;
+  };
+  std::vector<BottomBeamContext> bottom_beam_contexts;
+  std::vector<uint32_t> error_chain_bottom_context;
+  if (bottom_beam_enabled && config.pqlimit != std::numeric_limits<size_t>::max()) {
+    bottom_beam_contexts.reserve(std::min(config.pqlimit, size_t{4096}));
+    error_chain_bottom_context.reserve(std::min(config.pqlimit, size_t{65536}));
+  }
+
   std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
   std::unordered_map<size_t, std::unordered_set<boost::dynamic_bitset<>>> visited_detectors;
 
@@ -568,6 +587,21 @@ void TesseractDecoder::decode_to_errors_with_graph(
     }
 
     if (node.beam_dets > max_beam_dets) continue;
+
+    uint32_t bottom_context = NO_BOTTOM_CONTEXT;
+    if (bottom_beam_enabled && node.beam_dets == 0 && node.error_chain_idx != -1) {
+      assert(static_cast<size_t>(node.error_chain_idx) < error_chain_bottom_context.size());
+      bottom_context = error_chain_bottom_context[node.error_chain_idx];
+      if (bottom_context != NO_BOTTOM_CONTEXT) {
+        assert(bottom_context < bottom_beam_contexts.size());
+        auto& context = bottom_beam_contexts[bottom_context];
+        if (node.num_dets > context.min_virtual_dets &&
+            node.num_dets - context.min_virtual_dets > bottom_beam) {
+          continue;
+        }
+        context.min_virtual_dets = std::min(context.min_virtual_dets, node.num_dets);
+      }
+    }
 
     boost::dynamic_bitset<> detectors = initial_detectors;
     std::vector<DetectorCostTuple> detector_cost_tuples(num_errors);
@@ -766,12 +800,36 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
       if (next_cost == INF) continue;
 
+      uint32_t next_bottom_context = bottom_context;
+      if (bottom_beam_enabled) {
+        if (bottom_context != NO_BOTTOM_CONTEXT) {
+          if (next_beam_dets != 0 || next_num_dets > node.num_dets) {
+            throw std::runtime_error(
+                "A GARI bottom transition increased its virtual debt or re-entered the top.");
+          }
+          const auto& context = bottom_beam_contexts[bottom_context];
+          if (next_num_dets > context.min_virtual_dets &&
+              next_num_dets - context.min_virtual_dets > bottom_beam) {
+            continue;
+          }
+        } else if (node.beam_dets > 0 && next_beam_dets == 0 && next_num_dets > 0) {
+          if (bottom_beam_contexts.size() >= NO_BOTTOM_CONTEXT) {
+            throw std::runtime_error("Too many GARI bottom beam contexts.");
+          }
+          next_bottom_context = static_cast<uint32_t>(bottom_beam_contexts.size());
+          bottom_beam_contexts.push_back({next_num_dets});
+        }
+      }
+
       // Create the error chain node for this candidate.
       error_chain_arena.emplace_back();
       auto& next_node = error_chain_arena.back();
       next_node.error_index = ei;
       next_node.min_detector = min_detector;
       next_node.parent_idx = node.error_chain_idx;
+      if (bottom_beam_enabled) {
+        error_chain_bottom_context.push_back(next_bottom_context);
+      }
 
       pq.push({next_cost, next_num_dets, next_beam_dets, node.depth + 1,
                (int64_t)(error_chain_arena.size() - 1)});

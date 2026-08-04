@@ -62,13 +62,16 @@ suffix. Barred columns remain selectable from real pivots and create their
 virtual identity debt, but virtual pivots expose physical columns only. The
 beam counts active real detectors, so accumulated debt does not by itself
 prune a top branch; debt repayment still contributes to queue priority.
+Add `--gari-monolithic-bottom-beam 2` to give each entered debt its own fixed
+virtual-detector beam; omitting it preserves the unbounded-bottom behavior.
 Completed trials are compared using original physical-error cost only, and
 the `_ogL` layout makes observables physical-only. The standard
 `--beam-climbing`, `--no-revisit-dets`, ordering, sparsification, and queue-limit
 options remain available. One-way sparsification retains every physical column
-and sparsifies only eligible barred columns. The `gari_monolithic_one_way` statistics block
-records the layout sizes, real and virtual ordering policies, and the
-real-detector/physical-error scopes.
+and sparsifies only eligible barred columns. The `gari_monolithic_one_way`
+statistics block records the layout sizes, queue work by phase, entered bottom
+debts, same-weight bottom branching, ordering policies, and the beam/cost
+scopes.
 
 For two-stage decoding, add `--beam-climbing` to test beams 0 through 20. Set
 `--num-det-orders 21` to cycle through 21 randomized top index orders during

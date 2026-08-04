@@ -38,6 +38,7 @@ int suggest_sparsify_reactivate_limit(size_t num_detectors, int sparsify_base_de
 struct GariMonolithicOneWayConfig {
   size_t real_detector_count = 0;
   size_t physical_error_count = 0;
+  size_t bottom_beam = INF_DET_BEAM;
   bool collect_stats = false;
 };
 

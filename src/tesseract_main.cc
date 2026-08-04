@@ -232,6 +232,7 @@ struct Args {
   std::string custom_order;
   bool gari_two_stage = false;
   bool gari_monolithic_one_way = false;
+  size_t gari_monolithic_bottom_beam = INF_DET_BEAM;
   bool gari_split_top = false;
   std::string gari_bottom_decoder = "tesseract";
   size_t gari_bottom_beam = 2;
@@ -435,6 +436,11 @@ struct Args {
       if (num_det_orders == 0) {
         throw std::invalid_argument("--num-det-orders must be at least 1");
       }
+      if (program.is_used("--gari-monolithic-bottom-beam") &&
+          gari_monolithic_bottom_beam >= INF_DET_BEAM) {
+        throw std::invalid_argument(
+            "--gari-monolithic-bottom-beam must be below the infinity sentinel");
+      }
       if (program.is_used("--gari-bottom-decoder") ||
           program.is_used("--gari-bottom-beam") ||
           program.is_used("--gari-bottom-num-det-orders") ||
@@ -443,6 +449,9 @@ struct Args {
             "GARI two-stage bottom and candidate options cannot be used with "
             "--gari-monolithic-one-way");
       }
+    } else if (program.is_used("--gari-monolithic-bottom-beam")) {
+      throw std::invalid_argument(
+          "--gari-monolithic-bottom-beam requires --gari-monolithic-one-way");
     }
 
     bool has_base = program.is_used("--sparsify-base-degree");
@@ -579,6 +588,7 @@ struct Args {
       config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
           .real_detector_count = gari_two_stage_layout.physical_detector_count,
           .physical_error_count = gari_two_stage_layout.physical_error_count,
+          .bottom_beam = gari_monolithic_bottom_beam,
       };
     }
 
@@ -783,6 +793,13 @@ int main(int argc, char* argv[]) {
           "barred errors at virtual pivots")
       .flag()
       .store_into(args.gari_monolithic_one_way);
+  program.add_argument("--gari-monolithic-bottom-beam")
+      .help(
+          "Per-entry-debt virtual-detector beam for monolithic one-way GARI decoding "
+          "(disabled by default)")
+      .metavar("N")
+      .default_value(INF_DET_BEAM)
+      .store_into(args.gari_monolithic_bottom_beam);
   program.add_argument("--gari-split-top")
       .help("Decode the independent GARI D_X and D_Z top blocks separately")
       .flag()
@@ -942,7 +959,7 @@ int main(int argc, char* argv[]) {
   program.add_argument("--beam")
       .help(
           "Fixed beam, or maximum beam with climbing (default infinity; two-stage default 20; "
-          "one-way GARI counts real detectors only)")
+          "one-way GARI uses this beam for real detectors)")
       .metavar("N")
       .default_value(INF_DET_BEAM)
       .store_into(args.det_beam);
@@ -956,7 +973,7 @@ int main(int argc, char* argv[]) {
   program.add_argument("--beam-climbing")
       .help(
           "Use beam climbing (controls the outer top schedule in two-stage mode and the ordinary "
-          "monolithic schedule in one-way mode)")
+          "real-detector schedule in one-way mode)")
       .flag()
       .store_into(args.beam_climbing);
   program.add_argument("--no-revisit-dets")
@@ -1298,7 +1315,14 @@ int main(int argc, char* argv[]) {
           {"barred_error_count", args.gari_two_stage_layout.barred_error_count},
           {"real_detector_order_method", args.detector_order_method_name()},
           {"virtual_detector_order", "natural"},
-          {"beam_scope", "real_detectors"},
+          {"bottom_beam",
+           args.gari_monolithic_bottom_beam < INF_DET_BEAM
+               ? nlohmann::json(args.gari_monolithic_bottom_beam)
+               : nlohmann::json(nullptr)},
+          {"beam_scope",
+           args.gari_monolithic_bottom_beam < INF_DET_BEAM
+               ? "real_top_and_per_entry_virtual_bottom"
+               : "real_detectors"},
           {"final_cost_scope", "physical_errors"},
           {"top_queue_pops", totals.top_queue_pops},
           {"bottom_queue_pops", totals.bottom_queue_pops},
@@ -1306,11 +1330,11 @@ int main(int argc, char* argv[]) {
           {"bottom_contexts_explored", totals.bottom_contexts_explored},
           {"total_unique_bottom_debts_across_shots",
            totals.unique_bottom_debts_explored},
-          {"average_bottom_queue_pops_per_explored_context",
-           totals.bottom_contexts_explored == 0
+          {"average_bottom_queue_pops_per_generated_context",
+           totals.bottom_contexts_generated == 0
                ? 0.0
                : static_cast<double>(totals.bottom_queue_pops) /
-                     totals.bottom_contexts_explored},
+                     totals.bottom_contexts_generated},
           {"bottom_nonprogress_child_fraction",
            totals.bottom_children_generated == 0
                ? 0.0
