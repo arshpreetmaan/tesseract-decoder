@@ -149,6 +149,7 @@ cc_library(
     deps = [
         ":libtesseract",
         ":libutils",
+        "@pymatching//:libpymatching",
         "@stim//:stim_lib",
     ],
 )

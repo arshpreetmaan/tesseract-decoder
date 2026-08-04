@@ -1,0 +1,13 @@
+diff --git a/BUILD b/BUILD
+index 665e67b..1c1d9b2 100644
+--- a/BUILD
++++ b/BUILD
+@@ -39,1 +39,5 @@
+-    srcs = SOURCE_FILES_NO_MAIN,
++    srcs = [
++        src for src in SOURCE_FILES_NO_MAIN
++        if "/diagram/" not in src and not src.endswith("/namespaced_main.cc")
++    ],
+@@ -56,1 +60,1 @@
+-    data = glob(["testdata/**"]),
++    data = glob(["testdata/**"], allow_empty = True),

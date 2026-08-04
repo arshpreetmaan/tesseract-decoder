@@ -44,6 +44,14 @@ git_repository(
     shallow_since = "1741128853 +0000",
 )
 
+git_repository(
+    name = "pymatching",
+    commit = "6f63b2b9474ba0fa7e511fe52bffdce858a06984",
+    patch_args = ["-p1"],
+    patches = ["//third_party:pymatching_bazel8.patch"],
+    remote = "https://github.com/oscarhiggott/PyMatching.git",
+)
+
 http_archive(
     name = "highs",
     sha256 = HIGHS_SHA_256,
@@ -101,4 +109,3 @@ http_archive(
 
 cc_compatibility_proxy = use_extension("@rules_cc//cc:extensions.bzl", "compatibility_proxy")
 use_repo(cc_compatibility_proxy, "cc_compatibility_proxy")
-

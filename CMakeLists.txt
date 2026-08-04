@@ -16,6 +16,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(stim)
 
+# PyMatching's native C++ library. Its upstream CMake file also declares
+# executables and tests, so fetch the source here and define only the library
+# needed by Tesseract.
+FetchContent_Declare(
+  pymatching_source
+  GIT_REPOSITORY https://github.com/oscarhiggott/PyMatching.git
+  GIT_TAG 6f63b2b9474ba0fa7e511fe52bffdce858a06984
+)
+FetchContent_GetProperties(pymatching_source)
+if(NOT pymatching_source_POPULATED)
+  FetchContent_Populate(pymatching_source)
+endif()
+
 # HiGHS
 FetchContent_Declare(
   highs
@@ -77,6 +90,18 @@ set(OPT_COPTS -Ofast -fno-fast-math -march=native)
 
 set(TESSERACT_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+file(GLOB_RECURSE PYMATCHING_NATIVE_SOURCES CONFIGURE_DEPENDS
+  "${pymatching_source_SOURCE_DIR}/src/pymatching/*.cc")
+list(FILTER PYMATCHING_NATIVE_SOURCES EXCLUDE REGEX "\\.(test|perf|pybind)\\.cc$")
+list(FILTER PYMATCHING_NATIVE_SOURCES EXCLUDE REGEX "/main\\.cc$")
+list(FILTER PYMATCHING_NATIVE_SOURCES EXCLUDE REGEX "/diagram/")
+list(FILTER PYMATCHING_NATIVE_SOURCES EXCLUDE REGEX "/driver/namespaced_main\\.cc$")
+add_library(pymatching_native ${PYMATCHING_NATIVE_SOURCES})
+target_include_directories(pymatching_native PUBLIC
+  ${pymatching_source_SOURCE_DIR}/src)
+target_compile_options(pymatching_native PRIVATE ${OPT_COPTS})
+target_link_libraries(pymatching_native PUBLIC libstim Threads::Threads)
+
 # === Libraries ===
 add_library(common ${TESSERACT_SRC_DIR}/common.cc ${TESSERACT_SRC_DIR}/common.h)
 target_include_directories(common PUBLIC ${TESSERACT_SRC_DIR})
@@ -103,7 +128,8 @@ add_library(gari_two_stage_tesseract
   ${TESSERACT_SRC_DIR}/gari_two_stage_tesseract.h)
 target_include_directories(gari_two_stage_tesseract PUBLIC ${TESSERACT_SRC_DIR})
 target_compile_options(gari_two_stage_tesseract PRIVATE ${OPT_COPTS})
-target_link_libraries(gari_two_stage_tesseract PUBLIC tesseract_lib utils libstim)
+target_link_libraries(gari_two_stage_tesseract PUBLIC
+  tesseract_lib utils libstim pymatching_native)
 
 add_library(simplex ${TESSERACT_SRC_DIR}/simplex.cc ${TESSERACT_SRC_DIR}/simplex.h)
 target_include_directories(simplex PUBLIC ${TESSERACT_SRC_DIR})
