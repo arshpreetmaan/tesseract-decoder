@@ -38,6 +38,17 @@ int suggest_sparsify_reactivate_limit(size_t num_detectors, int sparsify_base_de
 struct GariMonolithicOneWayConfig {
   size_t real_detector_count = 0;
   size_t physical_error_count = 0;
+  bool collect_stats = false;
+};
+
+struct GariMonolithicOneWayStats {
+  size_t top_queue_pops = 0;
+  size_t bottom_queue_pops = 0;
+  size_t bottom_contexts_generated = 0;
+  size_t bottom_contexts_explored = 0;
+  size_t unique_bottom_debts_explored = 0;
+  size_t bottom_children_generated = 0;
+  size_t bottom_nonprogress_children_generated = 0;
 };
 
 struct TesseractConfig {
@@ -128,6 +139,7 @@ struct TesseractDecoder {
 
   bool low_confidence_flag = false;
   std::vector<size_t> predicted_errors_buffer;
+  GariMonolithicOneWayStats gari_monolithic_one_way_stats;
   std::vector<size_t> dem_error_to_error;
   std::vector<size_t> error_to_dem_error;
   std::vector<common::Error> errors;
@@ -165,9 +177,11 @@ struct TesseractDecoder {
   std::vector<std::vector<int>> beam_edets;
   size_t beam_detector_count = 0;
   bool gari_monolithic_one_way_enabled = false;
+  std::unordered_set<size_t> unique_bottom_debt_hashes;
   int sparse_d2e_reactivate_limit = -1;
   bool sparse_d2e_valid = false;
 
+  void reset_gari_monolithic_one_way_stats();
   void build_sparse_d2e(const std::vector<uint64_t>& detections);
   void decode_to_errors_with_graph(const std::vector<uint64_t>& detections, size_t detector_order,
                                    size_t detector_beam,

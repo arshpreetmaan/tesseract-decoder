@@ -1037,9 +1037,16 @@ int main(int argc, char* argv[]) {
   std::vector<std::unique_ptr<TesseractDecoder>> decoders(args.num_threads);
   std::vector<std::unique_ptr<GariTwoStageTesseractDecoder>> gari_decoders(args.num_threads);
   const bool collect_gari_stats = args.gari_two_stage && !args.stats_out_fname.empty();
+  const bool collect_one_way_stats =
+      args.gari_monolithic_one_way && !args.stats_out_fname.empty();
   std::vector<size_t> gari_unique_debts(collect_gari_stats ? shots.size() : 0);
   std::vector<size_t> gari_bottom_cache_hits(collect_gari_stats ? shots.size() : 0);
   std::vector<double> gari_bottom_decode_time_seconds(collect_gari_stats ? shots.size() : 0);
+  std::vector<GariMonolithicOneWayStats> one_way_stats(
+      collect_one_way_stats ? shots.size() : 0);
+  if (collect_one_way_stats) {
+    config.gari_monolithic_one_way->collect_stats = true;
+  }
   std::shared_ptr<const GariTwoStagePreparedModel> gari_prepared_model;
   GariTwoStageConfig gari_config;
   auto decoder_setup_start = std::chrono::high_resolution_clock::now();
@@ -1141,6 +1148,9 @@ int main(int argc, char* argv[]) {
           low_confidence[shot_index] = decoder.low_confidence_flag;
           cost_predicted[shot_index] =
               decoder.solution_cost_from_errors(decoder.predicted_errors_buffer);
+          if (collect_one_way_stats) {
+            one_way_stats[shot_index] = decoder.gari_monolithic_one_way_stats;
+          }
           if (!has_obs || shots[shot_index].obs_mask == obs_predicted[shot_index]) {
             for (size_t ei : decoder.predicted_errors_buffer) {
               ++error_use[ei];
@@ -1269,6 +1279,18 @@ int main(int argc, char* argv[]) {
       };
     }
     if (args.gari_monolithic_one_way) {
+      GariMonolithicOneWayStats totals;
+      for (size_t i = 0; i < shot; ++i) {
+        totals.top_queue_pops += one_way_stats[i].top_queue_pops;
+        totals.bottom_queue_pops += one_way_stats[i].bottom_queue_pops;
+        totals.bottom_contexts_generated += one_way_stats[i].bottom_contexts_generated;
+        totals.bottom_contexts_explored += one_way_stats[i].bottom_contexts_explored;
+        totals.unique_bottom_debts_explored +=
+            one_way_stats[i].unique_bottom_debts_explored;
+        totals.bottom_children_generated += one_way_stats[i].bottom_children_generated;
+        totals.bottom_nonprogress_children_generated +=
+            one_way_stats[i].bottom_nonprogress_children_generated;
+      }
       stats_json["gari_monolithic_one_way"] = {
           {"real_detector_count", args.gari_two_stage_layout.physical_detector_count},
           {"virtual_detector_count", args.gari_two_stage_layout.virtual_detector_count},
@@ -1278,6 +1300,22 @@ int main(int argc, char* argv[]) {
           {"virtual_detector_order", "natural"},
           {"beam_scope", "real_detectors"},
           {"final_cost_scope", "physical_errors"},
+          {"top_queue_pops", totals.top_queue_pops},
+          {"bottom_queue_pops", totals.bottom_queue_pops},
+          {"bottom_contexts_generated", totals.bottom_contexts_generated},
+          {"bottom_contexts_explored", totals.bottom_contexts_explored},
+          {"total_unique_bottom_debts_across_shots",
+           totals.unique_bottom_debts_explored},
+          {"average_bottom_queue_pops_per_explored_context",
+           totals.bottom_contexts_explored == 0
+               ? 0.0
+               : static_cast<double>(totals.bottom_queue_pops) /
+                     totals.bottom_contexts_explored},
+          {"bottom_nonprogress_child_fraction",
+           totals.bottom_children_generated == 0
+               ? 0.0
+               : static_cast<double>(totals.bottom_nonprogress_children_generated) /
+                     totals.bottom_children_generated},
       };
     }
 

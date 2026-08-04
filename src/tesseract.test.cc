@@ -275,6 +275,44 @@ TEST(GariMonolithicOneWayTest, CarriesDebtThroughARealOnlyBeam) {
   EXPECT_EQ(sparse_decoder.sparsify_mandatory_errors, (std::vector<int>{0, 1, 2}));
 }
 
+TEST(GariMonolithicOneWayTest, RecordsBottomSearchBreadth) {
+  stim::DetectorErrorModel dem(R"DEM(
+    error(0.1) D2 L0
+    error(0.2) D3 L1
+    error(0.01) D2 D3 L2
+    error(0.1) D0 D2
+    error(0.2) D1 D3
+  )DEM");
+  TesseractConfig config{dem};
+  config.det_orders = {{0, 1, 2, 3}, {0, 1, 2, 3}};
+  config.merge_errors = false;
+  config.no_revisit_dets = true;
+  config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
+      .real_detector_count = 2,
+      .physical_error_count = 3,
+      .collect_stats = true,
+  };
+  TesseractDecoder decoder(config);
+
+  decoder.decode_to_errors({0});
+
+  ASSERT_FALSE(decoder.low_confidence_flag);
+  const auto& stats = decoder.gari_monolithic_one_way_stats;
+  EXPECT_GT(stats.top_queue_pops, 0);
+  EXPECT_GT(stats.bottom_queue_pops, 0);
+  EXPECT_EQ(stats.bottom_contexts_generated, 2);
+  EXPECT_EQ(stats.bottom_contexts_explored, 2);
+  EXPECT_EQ(stats.unique_bottom_debts_explored, 1);
+  EXPECT_GE(stats.bottom_children_generated, 4);
+  EXPECT_GE(stats.bottom_nonprogress_children_generated, 2);
+
+  decoder.decode_to_errors({});
+  EXPECT_EQ(decoder.gari_monolithic_one_way_stats.top_queue_pops, 0);
+  EXPECT_EQ(decoder.gari_monolithic_one_way_stats.bottom_queue_pops, 0);
+  EXPECT_EQ(decoder.gari_monolithic_one_way_stats.bottom_contexts_generated, 0);
+  EXPECT_EQ(decoder.gari_monolithic_one_way_stats.unique_bottom_debts_explored, 0);
+}
+
 bool simplex_test_compare(stim::DetectorErrorModel& dem, std::vector<stim::SparseShot>& shots) {
   TesseractConfig tesseract_config{dem};
   TesseractDecoder tesseract_decoder(tesseract_config);

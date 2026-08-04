@@ -387,6 +387,7 @@ void TesseractDecoder::initialize_structures(size_t num_detectors) {
 }
 
 void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections) {
+  reset_gari_monolithic_one_way_stats();
   if (config.sparsify_errors) {
     build_sparse_d2e(detections);
   }
@@ -464,6 +465,7 @@ void TesseractDecoder::flip_detectors_and_block_errors(
 
 void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections,
                                         size_t detector_order, size_t detector_beam) {
+  reset_gari_monolithic_one_way_stats();
   if (config.sparsify_errors) {
     build_sparse_d2e(detections);
   }
@@ -474,6 +476,7 @@ void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections,
 std::vector<std::vector<size_t>> TesseractDecoder::decode_to_error_candidates(
     const std::vector<uint64_t>& detections, size_t detector_order, size_t detector_beam,
     size_t max_candidates) {
+  reset_gari_monolithic_one_way_stats();
   if (max_candidates == 0) {
     throw std::invalid_argument("max_candidates must be at least 1.");
   }
@@ -541,10 +544,28 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
   pq.push({initial_cost, detections.size(), min_beam_dets, 0, -1});
   size_t num_pq_pushed = 1;
+  const bool collect_one_way_stats =
+      gari_monolithic_one_way_enabled && config.gari_monolithic_one_way->collect_stats;
 
   while (!pq.empty()) {
     const Node node = pq.top();
     pq.pop();
+
+    bool is_bottom_entry = false;
+    if (collect_one_way_stats && node.error_chain_idx != -1) {
+      bool last_error_is_physical =
+          error_is_physical[error_chain_arena[node.error_chain_idx].error_index];
+      bool is_bottom_node =
+          node.beam_dets == 0 && (node.num_dets > 0 || last_error_is_physical);
+      if (is_bottom_node) {
+        ++gari_monolithic_one_way_stats.bottom_queue_pops;
+        is_bottom_entry = node.num_dets > 0 && !last_error_is_physical;
+      } else if (node.beam_dets > 0) {
+        ++gari_monolithic_one_way_stats.top_queue_pops;
+      }
+    } else if (collect_one_way_stats && node.beam_dets > 0) {
+      ++gari_monolithic_one_way_stats.top_queue_pops;
+    }
 
     if (node.beam_dets > max_beam_dets) continue;
 
@@ -610,6 +631,15 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
     if (config.no_revisit_dets && !visited_detectors[node.beam_dets].insert(detectors).second)
       continue;
+
+    if (is_bottom_entry) {
+      ++gari_monolithic_one_way_stats.bottom_contexts_explored;
+      // Retain only compact fingerprints so diagnostics do not copy every debt
+      // bitset inside the measured decode interval.
+      unique_bottom_debt_hashes.insert(boost::hash_value(detectors));
+      gari_monolithic_one_way_stats.unique_bottom_debts_explored =
+          unique_bottom_debt_hashes.size();
+    }
 
     if (config.create_visualization) {
       visualizer.add_activated_errors(node.error_chain_idx, error_chain_arena);
@@ -747,6 +777,17 @@ void TesseractDecoder::decode_to_errors_with_graph(
                (int64_t)(error_chain_arena.size() - 1)});
       ++num_pq_pushed;
 
+      if (collect_one_way_stats) {
+        if (node.beam_dets > 0 && next_beam_dets == 0 && next_num_dets > 0) {
+          ++gari_monolithic_one_way_stats.bottom_contexts_generated;
+        } else if (node.beam_dets == 0 && node.num_dets > 0) {
+          ++gari_monolithic_one_way_stats.bottom_children_generated;
+          if (next_num_dets == node.num_dets) {
+            ++gari_monolithic_one_way_stats.bottom_nonprogress_children_generated;
+          }
+        }
+      }
+
       if (num_pq_pushed > config.pqlimit) {
         if (config.verbose) {
           std::cout << (candidates != nullptr && !candidates->empty()
@@ -767,6 +808,11 @@ void TesseractDecoder::decode_to_errors_with_graph(
     std::cout << "Decoding failed to converge within beam limit." << std::endl;
   }
   low_confidence_flag = candidates == nullptr || candidates->empty();
+}
+
+void TesseractDecoder::reset_gari_monolithic_one_way_stats() {
+  gari_monolithic_one_way_stats = {};
+  unique_bottom_debt_hashes.clear();
 }
 
 double TesseractDecoder::cost_from_errors(const std::vector<size_t>& predicted_errors) const {
