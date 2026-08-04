@@ -65,6 +65,11 @@ std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
     const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout,
     bool prepare_top_components = false);
 
+enum class GariBottomBackend {
+  Tesseract,
+  PyMatching,
+};
+
 struct GariTwoStageConfig {
   size_t max_top_beam = 20;
   bool top_beam_climbing = false;
@@ -74,6 +79,7 @@ struct GariTwoStageConfig {
   DetOrder top_detector_order_method = DetOrder::DetIndex;
   uint64_t top_detector_order_seed = 0;
   bool top_no_revisit_dets = false;
+  GariBottomBackend bottom_backend = GariBottomBackend::Tesseract;
   size_t bottom_beam = 2;
   size_t num_bottom_detector_orders = 1;
   size_t pqlimit = DEFAULT_PQLIMIT;
@@ -92,6 +98,7 @@ struct GariTwoStageConfig {
 
 struct GariTwoStageDecodeResult {
   bool completed = false;
+  // Exact physical LLR cost for Tesseract; normalized MWPM weight for PyMatching.
   double physical_cost = std::numeric_limits<double>::infinity();
   std::vector<int> observables;
   std::vector<size_t> top_errors;
@@ -110,6 +117,7 @@ class GariTwoStageTesseractDecoder {
   GariTwoStageTesseractDecoder(
       std::shared_ptr<const GariTwoStagePreparedModel> prepared_model,
       GariTwoStageConfig config);
+  ~GariTwoStageTesseractDecoder();
 
   GariTwoStageDecodeResult decode(const std::vector<uint64_t>& top_detections);
 
@@ -119,9 +127,7 @@ class GariTwoStageTesseractDecoder {
   const stim::DetectorErrorModel& bottom_dem() const {
     return prepared_model_->bottom_dem;
   }
-  const std::vector<std::vector<size_t>>& bottom_detector_orders() const {
-    return bottom_decoder_->config.det_orders;
-  }
+  const std::vector<std::vector<size_t>>& bottom_detector_orders() const;
   const std::vector<std::vector<size_t>>& d_x_top_detector_orders() const {
     return d_x_top_decoder_->config.det_orders;
   }
@@ -131,14 +137,14 @@ class GariTwoStageTesseractDecoder {
   bool top_no_revisit_dets_enabled() const {
     return active_top_decoder().config.no_revisit_dets;
   }
-  bool bottom_no_revisit_dets_enabled() const {
-    return bottom_decoder_->config.no_revisit_dets;
-  }
+  bool bottom_no_revisit_dets_enabled() const;
   int top_sparsify_reactivate_limit() const {
     return active_top_decoder().config.sparsify_reactivate_limit;
   }
 
  private:
+  class BottomMatchingDecoder;
+
   const TesseractDecoder& active_top_decoder() const;
 
   std::shared_ptr<const GariTwoStagePreparedModel> prepared_model_;
@@ -147,6 +153,7 @@ class GariTwoStageTesseractDecoder {
   std::unique_ptr<TesseractDecoder> d_x_top_decoder_;
   std::unique_ptr<TesseractDecoder> d_z_top_decoder_;
   std::unique_ptr<TesseractDecoder> bottom_decoder_;
+  std::unique_ptr<BottomMatchingDecoder> bottom_matching_decoder_;
 };
 
 #endif  // GARI_TWO_STAGE_TESSERACT_H

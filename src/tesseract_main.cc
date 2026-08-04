@@ -195,6 +195,7 @@ struct Args {
   std::string custom_order;
   bool gari_two_stage = false;
   bool gari_split_top = false;
+  std::string gari_bottom_decoder = "tesseract";
   size_t gari_bottom_beam = 2;
   size_t gari_bottom_num_detector_orders = 1;
   size_t gari_top_candidates = 1;
@@ -267,6 +268,11 @@ struct Args {
     return DetOrder::DetIndex;
   }
 
+  GariBottomBackend gari_bottom_backend() const {
+    return gari_bottom_decoder == "pymatching" ? GariBottomBackend::PyMatching
+                                                : GariBottomBackend::Tesseract;
+  }
+
   void validate(const argparse::ArgumentParser& program) {
     if (circuit_path.empty() and dem_path.empty()) {
       throw std::invalid_argument("Must provide at least one of --circuit or --dem");
@@ -327,6 +333,13 @@ struct Args {
     if (gari_split_top && !gari_two_stage) {
       throw std::invalid_argument("--gari-split-top requires --gari-two-stage");
     }
+    if (gari_bottom_decoder != "tesseract" && gari_bottom_decoder != "pymatching") {
+      throw std::invalid_argument(
+          "--gari-bottom-decoder must be 'tesseract' or 'pymatching'");
+    }
+    if (!gari_two_stage && program.is_used("--gari-bottom-decoder")) {
+      throw std::invalid_argument("--gari-bottom-decoder requires --gari-two-stage");
+    }
     if (gari_two_stage) {
       if (dem_path.empty() || det_mapping_file.empty()) {
         throw std::invalid_argument(
@@ -350,6 +363,18 @@ struct Args {
       }
       if (gari_bottom_num_detector_orders == 0 || gari_bottom_num_detector_orders > 2) {
         throw std::invalid_argument("--gari-bottom-num-det-orders must be 1 or 2");
+      }
+      if (gari_bottom_decoder == "pymatching") {
+        if (gari_bottom_beam != 2 || gari_bottom_num_detector_orders != 1) {
+          throw std::invalid_argument(
+              "The PyMatching GARI bottom decoder requires the default "
+              "--gari-bottom-beam 2 and --gari-bottom-num-det-orders 1");
+        }
+        if (!dem_out_fname.empty()) {
+          throw std::invalid_argument(
+              "--dem-out is unavailable with --gari-bottom-decoder pymatching because "
+              "matching returns observables and cost, not physical error indices");
+        }
       }
     }
 
@@ -657,13 +682,18 @@ int main(int argc, char* argv[]) {
       .help("Decode the independent GARI D_X and D_Z top blocks separately")
       .flag()
       .store_into(args.gari_split_top);
+  program.add_argument("--gari-bottom-decoder")
+      .help("Bottom GARI decoder: tesseract (default) or pymatching")
+      .metavar("NAME")
+      .default_value(std::string("tesseract"))
+      .store_into(args.gari_bottom_decoder);
   program.add_argument("--gari-bottom-beam")
-      .help("Fixed detector beam for each bottom GARI completion")
+      .help("Fixed detector beam for each Tesseract bottom GARI completion")
       .metavar("N")
       .default_value(size_t(2))
       .store_into(args.gari_bottom_beam);
   program.add_argument("--gari-bottom-num-det-orders")
-      .help("Bottom index orders: 1 natural, or 2 natural and reverse")
+      .help("Tesseract bottom index orders: 1 natural, or 2 natural and reverse")
       .metavar("N")
       .default_value(size_t(1))
       .store_into(args.gari_bottom_num_detector_orders);
@@ -915,6 +945,7 @@ int main(int argc, char* argv[]) {
       gari_config.top_detector_order_seed = args.det_order_seed;
       gari_config.top_no_revisit_dets = args.no_revisit_dets;
       gari_config.top_detector_orders = args.gari_top_detector_orders;
+      gari_config.bottom_backend = args.gari_bottom_backend();
       gari_config.bottom_beam = args.gari_bottom_beam;
       gari_config.num_bottom_detector_orders = args.gari_bottom_num_detector_orders;
       gari_config.pqlimit = args.pqlimit;
@@ -1106,6 +1137,7 @@ int main(int argc, char* argv[]) {
           gari_bottom_decode_time_seconds.begin(),
           gari_bottom_decode_time_seconds.begin() + shot, 0.0);
       stats_json["gari_two_stage"] = {
+          {"bottom_decoder", args.gari_bottom_decoder},
           {"bottom_beam", args.gari_bottom_beam},
           {"bottom_num_det_orders", args.gari_bottom_num_detector_orders},
           {"split_top", args.gari_split_top},

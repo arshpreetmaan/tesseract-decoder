@@ -30,7 +30,7 @@ constexpr uint64_t test_data_seed = 752024;
 
 TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   stim::DetectorErrorModel dem(R"DEM(
-    error(0.1) D2 L0
+    error(0.1) D2 L0 L70
     error(0.2) D3 L1
     error(0.05) D2 D3 L0 L1
     error(0.1) D0 D2
@@ -94,6 +94,32 @@ TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   EXPECT_TRUE(climbing_result.completed);
   EXPECT_EQ(climbing_result.unique_debts, 1);
   EXPECT_EQ(climbing_result.bottom_cache_hits, 3);
+
+  config.bottom_backend = GariBottomBackend::PyMatching;
+  config.max_top_beam = 1;
+  config.top_beam_climbing = false;
+  GariTwoStageTesseractDecoder matching_decoder(prepared_model, config);
+  EXPECT_TRUE(matching_decoder.bottom_detector_orders().empty());
+  EXPECT_FALSE(matching_decoder.bottom_no_revisit_dets_enabled());
+
+  auto empty_result = matching_decoder.decode({});
+  ASSERT_TRUE(empty_result.completed);
+  EXPECT_TRUE(empty_result.observables.empty());
+  EXPECT_EQ(empty_result.physical_cost, 0);
+
+  auto boundary_result = matching_decoder.decode({0});
+  ASSERT_TRUE(boundary_result.completed);
+  EXPECT_TRUE(boundary_result.physical_errors.empty());
+  EXPECT_EQ(boundary_result.observables, (std::vector<int>{0, 70}));
+  EXPECT_NEAR(boundary_result.physical_cost, -std::log(0.1 / 0.9), 1e-6);
+
+  auto matching_result = matching_decoder.decode({0, 1});
+  ASSERT_TRUE(matching_result.completed);
+  EXPECT_TRUE(matching_result.physical_errors.empty());
+  EXPECT_EQ(matching_result.observables, (std::vector<int>{0, 1}));
+  EXPECT_NEAR(matching_result.physical_cost, -std::log(0.05 / 0.95), 1e-6);
+  EXPECT_EQ(matching_result.unique_debts, 1);
+  EXPECT_EQ(matching_result.bottom_cache_hits, 1);
 }
 
 TEST(GariTwoStageTesseractTest, AdditionalTopCandidateImprovesPhysicalCost) {

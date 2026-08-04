@@ -11,6 +11,9 @@
 #include <unordered_set>
 #include <utility>
 
+#include "pymatching/sparse_blossom/driver/mwpm_decoding.h"
+#include "pymatching/sparse_blossom/driver/user_graph.h"
+
 namespace {
 
 struct VectorHash {
@@ -263,6 +266,41 @@ TesseractConfig top_child_config(const stim::DetectorErrorModel& dem,
 
 }  // namespace
 
+class GariTwoStageTesseractDecoder::BottomMatchingDecoder {
+ public:
+  struct Result {
+    double cost;
+    std::vector<int> observables;
+  };
+
+  explicit BottomMatchingDecoder(const stim::DetectorErrorModel& dem)
+      : mwpm_(pm::detector_error_model_to_mwpm(
+            dem, pm::NUM_DISTINCT_WEIGHTS, /*ensure_search_flooder_included=*/false,
+            /*enable_correlations=*/false)),
+        scratch_(mwpm_.flooder.graph.num_observables) {}
+
+  Result decode(const std::vector<uint64_t>& debt) {
+    scratch_.reset();
+    pm::decode_detection_events(mwpm_, debt, scratch_.obs_crossed.data(), scratch_.weight,
+                                /*edge_correlations=*/false);
+
+    Result result{
+        .cost = static_cast<double>(scratch_.weight) /
+                mwpm_.flooder.graph.normalising_constant,
+    };
+    for (size_t observable = 0; observable < scratch_.obs_crossed.size(); ++observable) {
+      if (scratch_.obs_crossed[observable]) {
+        result.observables.push_back(static_cast<int>(observable));
+      }
+    }
+    return result;
+  }
+
+ private:
+  pm::Mwpm mwpm_;
+  pm::ExtendedMatchingResult scratch_;
+};
+
 std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
     const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout,
     bool prepare_top_components) {
@@ -463,6 +501,12 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   if (config_.num_bottom_detector_orders == 0 || config_.num_bottom_detector_orders > 2) {
     throw std::invalid_argument("GARI bottom detector-order count must be 1 or 2.");
   }
+  if (config_.bottom_backend == GariBottomBackend::PyMatching &&
+      (config_.bottom_beam != 2 || config_.num_bottom_detector_orders != 1)) {
+    throw std::invalid_argument(
+        "The PyMatching GARI bottom backend requires the default bottom beam 2 and "
+        "one bottom detector order; these Tesseract-only settings are not used.");
+  }
   if (config_.max_top_beam >= INF_DET_BEAM || config_.bottom_beam >= INF_DET_BEAM) {
     throw std::invalid_argument("GARI two-stage beams must be below the infinity sentinel.");
   }
@@ -505,20 +549,37 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
         top_child_config(prepared_model_->top_dem, config_, top_orders));
   }
 
-  TesseractConfig bottom_config = child_config(prepared_model_->bottom_dem, config_);
-  bottom_config.det_beam = config_.bottom_beam;
-  bottom_config.det_orders.resize(config_.num_bottom_detector_orders);
-  for (auto& order : bottom_config.det_orders) {
-    order.resize(layout.virtual_detector_count);
-    std::iota(order.begin(), order.end(), 0);
-  }
-  // Detector-index ordering has only two directions. Keep natural first so
-  // equal-cost ties preserve the original one-order result.
-  if (bottom_config.det_orders.size() == 2) {
-    std::reverse(bottom_config.det_orders[1].begin(), bottom_config.det_orders[1].end());
-  }
+  if (config_.bottom_backend == GariBottomBackend::PyMatching) {
+    bottom_matching_decoder_ =
+        std::make_unique<BottomMatchingDecoder>(prepared_model_->bottom_dem);
+  } else {
+    TesseractConfig bottom_config = child_config(prepared_model_->bottom_dem, config_);
+    bottom_config.det_beam = config_.bottom_beam;
+    bottom_config.det_orders.resize(config_.num_bottom_detector_orders);
+    for (auto& order : bottom_config.det_orders) {
+      order.resize(layout.virtual_detector_count);
+      std::iota(order.begin(), order.end(), 0);
+    }
+    // Detector-index ordering has only two directions. Keep natural first so
+    // equal-cost ties preserve the original one-order result.
+    if (bottom_config.det_orders.size() == 2) {
+      std::reverse(bottom_config.det_orders[1].begin(), bottom_config.det_orders[1].end());
+    }
 
-  bottom_decoder_ = std::make_unique<TesseractDecoder>(std::move(bottom_config));
+    bottom_decoder_ = std::make_unique<TesseractDecoder>(std::move(bottom_config));
+  }
+}
+
+GariTwoStageTesseractDecoder::~GariTwoStageTesseractDecoder() = default;
+
+const std::vector<std::vector<size_t>>&
+GariTwoStageTesseractDecoder::bottom_detector_orders() const {
+  static const std::vector<std::vector<size_t>> no_orders;
+  return bottom_decoder_ ? bottom_decoder_->config.det_orders : no_orders;
+}
+
+bool GariTwoStageTesseractDecoder::bottom_no_revisit_dets_enabled() const {
+  return bottom_decoder_ && bottom_decoder_->config.no_revisit_dets;
 }
 
 const TesseractDecoder& GariTwoStageTesseractDecoder::active_top_decoder() const {
@@ -584,11 +645,19 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       outcome = cached->second;
     } else {
       auto decode_bottom = [&]() {
-        // Preserve the original direct path when bottom diversity is disabled.
-        if (config_.num_bottom_detector_orders == 1) {
-          bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0, config_.bottom_beam);
+        if (config_.bottom_backend == GariBottomBackend::PyMatching) {
+          auto matching_result = bottom_matching_decoder_->decode(debt);
+          outcome.completed = true;
+          outcome.cost = matching_result.cost;
+          outcome.observables = std::move(matching_result.observables);
         } else {
-          bottom_decoder_->decode_to_errors(debt);
+          // Preserve the original direct path when bottom diversity is disabled.
+          if (config_.num_bottom_detector_orders == 1) {
+            bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0,
+                                              config_.bottom_beam);
+          } else {
+            bottom_decoder_->decode_to_errors(debt);
+          }
         }
       };
       if (config_.collect_bottom_timing) {
@@ -600,16 +669,18 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
         decode_bottom();
       }
 
-      outcome.completed = !bottom_decoder_->low_confidence_flag;
-      if (outcome.completed) {
-        outcome.errors = bottom_decoder_->predicted_errors_buffer;
-        if (!reproduces_syndrome(prepared_model_->bottom_error_detectors, outcome.errors, debt,
-                                 layout.virtual_detector_count)) {
-          throw std::runtime_error(
-              "Completed bottom GARI candidate does not reproduce its debt syndrome.");
+      if (config_.bottom_backend == GariBottomBackend::Tesseract) {
+        outcome.completed = !bottom_decoder_->low_confidence_flag;
+        if (outcome.completed) {
+          outcome.errors = bottom_decoder_->predicted_errors_buffer;
+          if (!reproduces_syndrome(prepared_model_->bottom_error_detectors, outcome.errors, debt,
+                                   layout.virtual_detector_count)) {
+            throw std::runtime_error(
+                "Completed bottom GARI candidate does not reproduce its debt syndrome.");
+          }
+          outcome.cost = bottom_decoder_->cost_from_errors(outcome.errors);
+          outcome.observables = bottom_decoder_->get_flipped_observables(outcome.errors);
         }
-        outcome.cost = bottom_decoder_->cost_from_errors(outcome.errors);
-        outcome.observables = bottom_decoder_->get_flipped_observables(outcome.errors);
       }
       bottom_cache.emplace(debt, outcome);
     }

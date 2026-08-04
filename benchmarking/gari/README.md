@@ -63,11 +63,23 @@ natural and reversed bottom detector-index orders at the fixed
 of 1 preserves the natural-order path. Detector-index ordering has only these
 two distinct directions, so larger values are rejected.
 
+Use `--gari-bottom-decoder pymatching` to complete each new debt with the
+native PyMatching backend instead. Tesseract remains the default. The bottom
+model is converted once per worker; one-target columns become boundary edges,
+two-target columns become ordinary edges, and PyMatching's normal DEM handling
+is used for parallel edges. The debt cache and bottom-cost reranking remain
+active; with this backend, that cost is PyMatching's normalized, discretized
+MWPM weight. PyMatching does not use the Tesseract-only bottom beam or detector
+orders, so their defaults (`2` and `1`) must be retained. It returns logical
+observables and cost but not physical error indices, making this backend
+incompatible with `--dem-out`.
+
 With `--stats-out`, the `gari_two_stage` JSON block reports
 `bottom_decode_time_seconds` and `bottom_decode_time_fraction_of_total`. These
-measure bottom Tesseract solver calls on cache misses; the fraction uses the
-existing aggregate `total_time_seconds` value. `bottom_num_det_orders`
-records the configured bottom-order count.
+measure bottom solver calls on cache misses; the fraction uses the existing
+aggregate `total_time_seconds` value. `bottom_decoder` identifies the selected
+backend. The existing `bottom_beam` and `bottom_num_det_orders` keys are kept;
+for PyMatching they record the required default values `2` and `1`.
 
 `total_time_seconds` contains only accumulated shot-decoding time. Decoder
 construction and the one-time GARI partition are reported separately as
