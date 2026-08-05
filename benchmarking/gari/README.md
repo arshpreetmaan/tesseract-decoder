@@ -55,7 +55,7 @@ A fixed beam with one top order performs one top-and-bottom pass:
   --stats-out "<fixed-stats>.json"
 ```
 
-For projected one-way decoding over the full GARI model, use the mapped
+For projected one-way decoding from the mapped GARI model, use the
 `_ogL_modeN.dem` with `--gari-monolithic-one-way` instead of
 `--gari-two-stage`:
 
@@ -71,12 +71,17 @@ For projected one-way decoding over the full GARI model, use the mapped
   --pqlimit 1000000 --stats-out "<one-way-stats>.json"
 ```
 
-For each detector-order trial, this mode first runs an independent-style
-Tesseract search on the projected real block. Its state, priority, beam, and
-visited key contain only the real residual. By default, the first zero-real
-state popped from that queue is frozen and all other top states are discarded.
-Its virtual debt is materialized only at that boundary and passed to a
-physical-only bottom search in natural detector order.
+The input GARI model is partitioned once before worker construction. Each
+worker searches a compact combined top model containing only real detector
+rows and barred columns, followed by a compact bottom model containing only
+virtual detector rows and physical columns. The top remains a joint
+`D_X`/`D_Z` search; it is not split into independent components in this mode.
+
+For each detector-order trial, the top state, priority, beam, and visited key
+contain only the real residual. By default, the first zero-real state popped
+from that queue is frozen and all other top states are discarded. Its virtual
+debt is materialized only at that boundary and passed to the physical-only
+bottom search in natural detector order.
 
 Set `--gari-monolithic-continuation-factor F` to keep the same projected top
 queue alive. If its first completion takes `P0` top queue pops, the decoder
@@ -95,8 +100,9 @@ bottom key. Omitting the flag disables both visited-state filters.
 Completed trials are compared using original physical-error cost only, and
 the `_ogL` layout makes observables physical-only. The standard
 `--beam-climbing`, `--no-revisit-dets`, ordering, sparsification, and queue-limit
-options remain available. One-way sparsification retains every physical column
-and sparsifies only eligible barred columns. The `gari_monolithic_one_way`
+options remain available. One-way sparsification applies only to eligible
+barred columns in the compact top model; the compact physical bottom remains
+fully active. The `gari_monolithic_one_way`
 statistics block records the layout sizes, queue work by phase, entered bottom
 debt, cache hits, top completions, continuation work and improvements,
 queue-limit truncations, same-weight bottom branching, ordering policies, and

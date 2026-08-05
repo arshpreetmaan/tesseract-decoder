@@ -175,4 +175,85 @@ class GariTwoStageTesseractDecoder {
   std::unique_ptr<BottomMatchingDecoder> bottom_matching_decoder_;
 };
 
+// Runs the projected one-way GARI search on compact child graphs while keeping
+// the combined D_X/D_Z top priority queue live across physical completions.
+// Error indices in the result are local to top_dem and bottom_dem.
+struct GariMonolithicOneWayDecoderConfig {
+  size_t max_beam = 20;
+  bool beam_climbing = false;
+  size_t num_detector_orders = 21;
+  DetOrder detector_order_method = DetOrder::DetIndex;
+  uint64_t detector_order_seed = 0;
+  bool no_revisit_dets = false;
+  bool bottom_merge_errors = true;
+  size_t bottom_beam = INF_DET_BEAM;
+  double continuation_factor = 0;
+  size_t pqlimit = DEFAULT_PQLIMIT;
+  double det_penalty = 0;
+  bool sparsify_errors = false;
+  int sparsify_base_degree = -1;
+  int sparsify_max_degree = -1;
+  int sparsify_reactivate_limit = -1;
+  bool collect_stats = false;
+  bool verbose = false;
+  std::vector<std::vector<size_t>> detector_orders;
+  // Source detector index -> compact top detector index. DetIndex orders use
+  // this source chronology instead of the block-grouped GARI row order.
+  std::vector<size_t> source_to_top_detector;
+};
+
+struct GariMonolithicOneWayStats {
+  size_t top_queue_pops = 0;
+  size_t top_completions_seen = 0;
+  size_t continuation_top_queue_pops = 0;
+  size_t continuation_physical_improvements = 0;
+  size_t pqlimit_truncated_trials = 0;
+  size_t bottom_queue_pops = 0;
+  size_t bottom_contexts_generated = 0;
+  size_t bottom_contexts_explored = 0;
+  size_t bottom_cache_hits = 0;
+  size_t unique_bottom_debts_explored = 0;
+  size_t bottom_children_generated = 0;
+  size_t bottom_nonprogress_children_generated = 0;
+};
+
+struct GariMonolithicOneWayDecodeResult {
+  bool completed = false;
+  double physical_cost = std::numeric_limits<double>::infinity();
+  std::vector<int> observables;
+  std::vector<size_t> top_errors;
+  std::vector<size_t> physical_errors;
+  GariMonolithicOneWayStats stats;
+};
+
+class GariMonolithicOneWayTesseractDecoder {
+ public:
+  GariMonolithicOneWayTesseractDecoder(
+      std::shared_ptr<const GariTwoStagePreparedModel> prepared_model,
+      GariMonolithicOneWayDecoderConfig config);
+  ~GariMonolithicOneWayTesseractDecoder();
+
+  GariMonolithicOneWayDecodeResult decode(
+      const std::vector<uint64_t>& top_detections);
+
+  const stim::DetectorErrorModel& compact_top_dem() const;
+  const stim::DetectorErrorModel& compact_bottom_dem() const;
+  const std::vector<std::vector<size_t>>& top_detector_orders() const;
+  size_t compact_top_detector_count() const;
+  size_t compact_top_error_count() const;
+  size_t compact_bottom_detector_count() const;
+  size_t compact_bottom_error_count() const;
+  bool top_no_revisit_dets_enabled() const;
+  bool bottom_no_revisit_dets_enabled() const;
+  bool top_merge_errors_enabled() const;
+  bool bottom_merge_errors_enabled() const;
+  int top_sparsify_reactivate_limit() const;
+
+ private:
+  class Impl;
+
+  std::shared_ptr<const GariTwoStagePreparedModel> prepared_model_;
+  std::unique_ptr<Impl> impl_;
+};
+
 #endif  // GARI_TWO_STAGE_TESSERACT_H

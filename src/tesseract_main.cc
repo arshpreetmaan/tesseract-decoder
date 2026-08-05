@@ -193,28 +193,6 @@ std::vector<std::vector<size_t>> build_mapped_index_orders(
   return orders;
 }
 
-std::vector<std::vector<size_t>> append_natural_virtual_suffix(
-    std::vector<std::vector<size_t>> real_orders, size_t real_detectors,
-    size_t virtual_detectors) {
-  for (auto& order : real_orders) {
-    if (order.size() != real_detectors) {
-      throw std::invalid_argument("GARI real detector order has the wrong size");
-    }
-    std::vector<bool> seen(real_detectors);
-    for (size_t detector : order) {
-      if (detector >= real_detectors || seen[detector]) {
-        throw std::invalid_argument("GARI real detector order must be a permutation");
-      }
-      seen[detector] = true;
-    }
-    order.reserve(real_detectors + virtual_detectors);
-    for (size_t detector = 0; detector < virtual_detectors; ++detector) {
-      order.push_back(real_detectors + detector);
-    }
-  }
-  return real_orders;
-}
-
 std::vector<std::vector<size_t>> filter_custom_orders_to_top(
     const std::vector<std::vector<size_t>>& gari_orders, size_t physical_detectors,
     size_t total_detectors) {
@@ -621,24 +599,6 @@ struct Args {
 
     config.merge_errors = !no_merge_errors;
 
-    if (gari_monolithic_one_way) {
-      std::vector<double> original_physical_costs;
-      if (gari_two_stage_layout.prior_policy == GariPriorPolicy::ModePR) {
-        original_physical_costs = reconstruct_gari_original_physical_costs(
-            config.dem, gari_two_stage_layout);
-      } else {
-        validate_gari_monolithic_one_way_model(config.dem,
-                                               gari_two_stage_layout);
-      }
-      config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
-          .real_detector_count = gari_two_stage_layout.physical_detector_count,
-          .physical_error_count = gari_two_stage_layout.physical_error_count,
-          .original_physical_costs = std::move(original_physical_costs),
-          .bottom_beam = gari_monolithic_bottom_beam,
-          .continuation_factor = gari_monolithic_continuation_factor,
-      };
-    }
-
     // Sample orientations of the error model to use for the det priority
     {
       if (verbose) {
@@ -690,9 +650,8 @@ struct Args {
                                                 detector_order_method(), det_order_seed);
           real_orders = map_source_orders_to_top(source_orders, det_mapping);
         }
-        config.det_orders = append_natural_virtual_suffix(
-            std::move(real_orders), gari_two_stage_layout.physical_detector_count,
-            gari_two_stage_layout.virtual_detector_count);
+        gari_top_detector_orders = std::move(real_orders);
+        config.det_orders.clear();
       } else if (!custom_det_orders.empty()) {
         for (const auto& order : custom_det_orders) {
           if (order.size() != config.dem.count_detectors()) {
@@ -1108,6 +1067,8 @@ int main(int argc, char* argv[]) {
   stim::DetectorErrorModel original_dem = config.dem.flattened();
   std::vector<std::unique_ptr<TesseractDecoder>> decoders(args.num_threads);
   std::vector<std::unique_ptr<GariTwoStageTesseractDecoder>> gari_decoders(args.num_threads);
+  std::vector<std::unique_ptr<GariMonolithicOneWayTesseractDecoder>>
+      one_way_decoders(args.num_threads);
   const bool collect_gari_stats = args.gari_two_stage && !args.stats_out_fname.empty();
   const bool collect_one_way_stats =
       args.gari_monolithic_one_way && !args.stats_out_fname.empty();
@@ -1116,11 +1077,9 @@ int main(int argc, char* argv[]) {
   std::vector<double> gari_bottom_decode_time_seconds(collect_gari_stats ? shots.size() : 0);
   std::vector<GariMonolithicOneWayStats> one_way_stats(
       collect_one_way_stats ? shots.size() : 0);
-  if (collect_one_way_stats) {
-    config.gari_monolithic_one_way->collect_stats = true;
-  }
   std::shared_ptr<const GariTwoStagePreparedModel> gari_prepared_model;
   GariTwoStageConfig gari_config;
+  GariMonolithicOneWayDecoderConfig one_way_config;
   auto decoder_setup_start = std::chrono::high_resolution_clock::now();
   try {
     if (args.gari_two_stage) {
@@ -1152,6 +1111,47 @@ int main(int argc, char* argv[]) {
         decoder =
             std::make_unique<GariTwoStageTesseractDecoder>(gari_prepared_model, gari_config);
       }
+    } else if (args.gari_monolithic_one_way) {
+      gari_prepared_model = prepare_gari_two_stage_model(
+          original_dem, args.gari_two_stage_layout,
+          /*prepare_top_components=*/false);
+      one_way_config.max_beam = args.det_beam;
+      one_way_config.beam_climbing = args.beam_climbing;
+      one_way_config.num_detector_orders = args.num_det_orders;
+      one_way_config.detector_order_method = args.detector_order_method();
+      one_way_config.detector_order_seed = args.det_order_seed;
+      one_way_config.no_revisit_dets = args.no_revisit_dets;
+      one_way_config.bottom_merge_errors = config.merge_errors;
+      one_way_config.bottom_beam = args.gari_monolithic_bottom_beam;
+      one_way_config.continuation_factor =
+          args.gari_monolithic_continuation_factor;
+      one_way_config.pqlimit = args.pqlimit;
+      one_way_config.det_penalty = args.det_penalty;
+      one_way_config.sparsify_errors = args.sparsify_errors;
+      one_way_config.sparsify_base_degree = args.sparsify_base_degree;
+      one_way_config.sparsify_max_degree = args.sparsify_max_degree;
+      one_way_config.sparsify_reactivate_limit =
+          args.sparsify_reactivate_limit;
+      if (one_way_config.sparsify_errors &&
+          one_way_config.sparsify_reactivate_limit == -1) {
+        const int full_error_count = static_cast<int>(std::min<uint64_t>(
+            original_dem.count_errors(),
+            static_cast<uint64_t>(std::numeric_limits<int>::max())));
+        one_way_config.sparsify_reactivate_limit = std::min(
+            suggest_sparsify_reactivate_limit(
+                args.gari_two_stage_layout.physical_detector_count,
+                one_way_config.sparsify_base_degree),
+            full_error_count);
+      }
+      one_way_config.collect_stats = collect_one_way_stats;
+      one_way_config.verbose = args.verbose;
+      one_way_config.detector_orders = args.gari_top_detector_orders;
+      one_way_config.source_to_top_detector =
+          args.gari_source_to_top_detector;
+      for (auto& decoder : one_way_decoders) {
+        decoder = std::make_unique<GariMonolithicOneWayTesseractDecoder>(
+            gari_prepared_model, one_way_config);
+      }
     } else {
       for (auto& decoder : decoders) {
         decoder = std::make_unique<TesseractDecoder>(config);
@@ -1165,10 +1165,14 @@ int main(int argc, char* argv[]) {
       std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - decoder_setup_start)
           .count();
   size_t error_use_count =
-      !args.gari_two_stage || !args.dem_out_fname.empty() ? original_dem.count_errors() : 0;
+      (!args.gari_two_stage && !args.gari_monolithic_one_way) ||
+              !args.dem_out_fname.empty()
+          ? original_dem.count_errors()
+          : 0;
   std::vector<std::vector<size_t>> error_use_per_thread(
       args.num_threads, std::vector<size_t>(error_use_count));
-  if (args.gari_two_stage && args.dem_out_fname.empty()) {
+  if ((args.gari_two_stage || args.gari_monolithic_one_way) &&
+      args.dem_out_fname.empty()) {
     config.dem = stim::DetectorErrorModel();
     original_dem = stim::DetectorErrorModel();
   }
@@ -1206,6 +1210,34 @@ int main(int argc, char* argv[]) {
               ++error_use[args.gari_two_stage_layout.physical_error_count + error];
             }
           }
+        } else if (args.gari_monolithic_one_way) {
+          const auto start_time = std::chrono::high_resolution_clock::now();
+          auto result =
+              one_way_decoders[thread_index]->decode(shots[shot_index].hits);
+          decoding_time_seconds[shot_index] =
+              std::chrono::duration<double>(
+                  std::chrono::high_resolution_clock::now() - start_time)
+                  .count();
+          obs_predicted[shot_index].clear();
+          for (int observable : result.observables) {
+            obs_predicted[shot_index][observable] ^= 1;
+          }
+          low_confidence[shot_index] = !result.completed;
+          cost_predicted[shot_index] = result.physical_cost;
+          if (collect_one_way_stats) {
+            one_way_stats[shot_index] = result.stats;
+          }
+          if ((!has_obs ||
+               shots[shot_index].obs_mask == obs_predicted[shot_index]) &&
+              !error_use.empty()) {
+            for (size_t error : result.physical_errors) {
+              ++error_use[error];
+            }
+            for (size_t error : result.top_errors) {
+              ++error_use[args.gari_two_stage_layout.physical_error_count +
+                          error];
+            }
+          }
         } else {
           auto& decoder = *decoders[thread_index];
           const auto start_time = std::chrono::high_resolution_clock::now();
@@ -1220,9 +1252,6 @@ int main(int argc, char* argv[]) {
           low_confidence[shot_index] = decoder.low_confidence_flag;
           cost_predicted[shot_index] =
               decoder.solution_cost_from_errors(decoder.predicted_errors_buffer);
-          if (collect_one_way_stats) {
-            one_way_stats[shot_index] = decoder.gari_monolithic_one_way_stats;
-          }
           if (!has_obs || shots[shot_index].obs_mask == obs_predicted[shot_index]) {
             for (size_t ei : decoder.predicted_errors_buffer) {
               ++error_use[ei];
@@ -1279,6 +1308,10 @@ int main(int argc, char* argv[]) {
   if (args.gari_two_stage && args.sparsify_errors && !gari_decoders.empty()) {
     effective_sparsify_reactivate_limit =
         gari_decoders.front()->top_sparsify_reactivate_limit();
+  } else if (args.gari_monolithic_one_way && args.sparsify_errors &&
+             !one_way_decoders.empty()) {
+    effective_sparsify_reactivate_limit =
+        one_way_decoders.front()->top_sparsify_reactivate_limit();
   } else {
     for (const auto& decoder : decoders) {
       if (decoder) {

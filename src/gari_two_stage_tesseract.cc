@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
+#include <iostream>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -908,4 +911,788 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
   }
   result.unique_debts = bottom_cache.size();
   return result;
+}
+
+namespace {
+
+struct CompactBitsetHash {
+  size_t operator()(const boost::dynamic_bitset<>& bits) const {
+    return boost::hash_value(bits);
+  }
+};
+
+struct CompactPhaseWorkspace {
+  std::vector<DetectorCostTuple> initial_cost_tuples;
+  std::vector<DetectorCostTuple> detector_cost_tuples;
+  std::vector<DetectorCostTuple> next_detector_cost_tuples;
+  std::vector<double> detector_cost_cache;
+  boost::dynamic_bitset<> detectors;
+  boost::dynamic_bitset<> next_detectors;
+
+  CompactPhaseWorkspace(size_t num_errors, size_t num_detectors)
+      : initial_cost_tuples(num_errors),
+        detector_cost_tuples(num_errors),
+        next_detector_cost_tuples(num_errors),
+        detector_cost_cache(num_detectors),
+        detectors(num_detectors),
+        next_detectors(num_detectors) {}
+};
+
+struct CompactOneWayTrialResult {
+  bool completed = false;
+  double physical_cost = std::numeric_limits<double>::infinity();
+  std::vector<size_t> top_errors;
+  std::vector<size_t> physical_errors;
+};
+
+struct CompactBottomOutcome {
+  bool completed = false;
+  double cost = std::numeric_limits<double>::infinity();
+  std::vector<size_t> errors;
+};
+
+}  // namespace
+
+class GariMonolithicOneWayTesseractDecoder::Impl {
+ public:
+  Impl(std::shared_ptr<const GariTwoStagePreparedModel> prepared_model,
+       GariMonolithicOneWayDecoderConfig config)
+      : prepared_model_(std::move(prepared_model)), config_(std::move(config)) {
+    if (!prepared_model_) {
+      throw std::invalid_argument(
+          "GARI one-way prepared model must not be null.");
+    }
+    if (config_.num_detector_orders == 0 && config_.detector_orders.empty()) {
+      throw std::invalid_argument(
+          "GARI one-way detector-order count must be positive.");
+    }
+    if (!std::isfinite(config_.continuation_factor) ||
+        config_.continuation_factor < 0) {
+      throw std::invalid_argument(
+          "GARI one-way continuation factor must be finite and nonnegative.");
+    }
+    if (config_.beam_climbing && config_.max_beam >= INF_DET_BEAM) {
+      throw std::invalid_argument(
+          "GARI one-way beam climbing requires a finite beam.");
+    }
+    debt_bits_.resize(prepared_model_->layout.virtual_detector_count);
+
+    GariTwoStageConfig top_settings;
+    top_settings.max_top_beam = config_.max_beam;
+    top_settings.num_top_detector_orders = config_.num_detector_orders;
+    top_settings.top_detector_order_method = config_.detector_order_method;
+    top_settings.top_detector_order_seed = config_.detector_order_seed;
+    top_settings.top_no_revisit_dets = config_.no_revisit_dets;
+    top_settings.pqlimit = config_.pqlimit;
+    top_settings.top_det_penalty = config_.det_penalty;
+    top_settings.top_sparsify_errors = config_.sparsify_errors;
+    top_settings.top_sparsify_base_degree = config_.sparsify_base_degree;
+    top_settings.top_sparsify_max_degree = config_.sparsify_max_degree;
+    top_settings.top_sparsify_reactivate_limit =
+        config_.sparsify_reactivate_limit;
+    top_settings.verbose = config_.verbose;
+    top_settings.top_detector_orders = std::move(config_.detector_orders);
+    top_settings.source_to_top_detector =
+        std::move(config_.source_to_top_detector);
+    auto top_orders = build_top_orders(prepared_model_->top_dem, top_settings);
+    top_decoder_ = std::make_unique<TesseractDecoder>(top_child_config(
+        prepared_model_->top_dem, top_settings, std::move(top_orders)));
+
+    TesseractConfig bottom_config =
+        child_config(prepared_model_->bottom_dem, top_settings);
+    bottom_config.det_beam = config_.bottom_beam;
+    bottom_config.no_revisit_dets = config_.no_revisit_dets;
+    bottom_config.merge_errors = config_.bottom_merge_errors;
+    bottom_config.det_penalty = config_.det_penalty;
+    bottom_config.det_orders.resize(1);
+    bottom_config.det_orders[0].resize(
+        prepared_model_->layout.virtual_detector_count);
+    std::iota(bottom_config.det_orders[0].begin(),
+              bottom_config.det_orders[0].end(), 0);
+    bottom_decoder_ =
+        std::make_unique<TesseractDecoder>(std::move(bottom_config));
+
+    const double unset_cost = std::numeric_limits<double>::quiet_NaN();
+    bottom_original_costs_by_error_.assign(bottom_decoder_->num_errors,
+                                           unset_cost);
+    for (size_t original_error = 0;
+         original_error < prepared_model_->original_physical_costs.size();
+         ++original_error) {
+      const size_t retained_error =
+          bottom_decoder_->dem_error_to_error.at(original_error);
+      if (retained_error == std::numeric_limits<size_t>::max()) continue;
+      double& retained_cost =
+          bottom_original_costs_by_error_[retained_error];
+      const double original_cost =
+          prepared_model_->original_physical_costs[original_error];
+      retained_cost = std::isnan(retained_cost)
+                          ? original_cost
+                          : common::merge_weights(retained_cost, original_cost);
+    }
+
+    top_workspace_ = std::make_unique<CompactPhaseWorkspace>(
+        top_decoder_->num_errors, top_decoder_->num_detectors);
+    bottom_workspace_ = std::make_unique<CompactPhaseWorkspace>(
+        bottom_decoder_->num_errors, bottom_decoder_->num_detectors);
+    if (config_.pqlimit != std::numeric_limits<size_t>::max()) {
+      top_decoder_->error_chain_arena.reserve(config_.pqlimit);
+    }
+  }
+
+  GariMonolithicOneWayDecodeResult decode(
+      const std::vector<uint64_t>& top_detections) {
+    stats_ = {};
+    bottom_cache_.clear();
+    unique_bottom_debts_explored_.clear();
+    physical_incumbent_ = std::numeric_limits<double>::infinity();
+    GariMonolithicOneWayDecodeResult result;
+    if (top_detections.empty()) {
+      result.completed = true;
+      result.physical_cost = 0;
+      result.stats = stats_;
+      return result;
+    }
+
+    const auto& layout = prepared_model_->layout;
+    std::vector<bool> seen_detection(layout.physical_detector_count, false);
+    for (uint64_t detector : top_detections) {
+      if (detector >= layout.physical_detector_count) {
+        throw std::invalid_argument(
+            "GARI one-way syndrome references a non-real detector.");
+      }
+      if (seen_detection[detector]) {
+        throw std::invalid_argument(
+            "GARI one-way syndrome contains a repeated detector.");
+      }
+      seen_detection[detector] = true;
+    }
+
+    const auto& active_top_d2e = prepare_top_d2e(top_detections);
+    boost::dynamic_bitset<> top_state(top_decoder_->num_detectors);
+    for (uint64_t detector : top_detections) top_state[detector] = 1;
+    const double top_initial_cost = initial_phase_cost(
+        *top_decoder_, top_state, active_top_d2e, *top_workspace_);
+    if (top_initial_cost == INF) {
+      result.stats = stats_;
+      return result;
+    }
+    const size_t order_count = top_decoder_->config.det_orders.size();
+    const size_t trial_count =
+        config_.beam_climbing
+            ? std::max(config_.max_beam + 1, order_count)
+            : order_count;
+    for (size_t trial = 0; trial < trial_count; ++trial) {
+      const size_t beam = config_.beam_climbing
+                              ? trial % (config_.max_beam + 1)
+                              : config_.max_beam;
+      const size_t order = trial % order_count;
+      CompactOneWayTrialResult trial_result = run_trial(
+          top_state, top_initial_cost, active_top_d2e, order, beam);
+      if (trial_result.completed &&
+          trial_result.physical_cost < result.physical_cost) {
+        result.completed = true;
+        result.physical_cost = trial_result.physical_cost;
+        result.top_errors = std::move(trial_result.top_errors);
+        result.physical_errors = std::move(trial_result.physical_errors);
+      }
+    }
+    if (result.completed) {
+      result.observables =
+          bottom_decoder_->get_flipped_observables(result.physical_errors);
+    }
+    result.stats = stats_;
+    return result;
+  }
+
+  const TesseractDecoder& top_decoder() const {
+    return *top_decoder_;
+  }
+
+  const TesseractDecoder& bottom_decoder() const {
+    return *bottom_decoder_;
+  }
+
+ private:
+  struct OptionalErrorCandidate {
+    int error_index;
+    int overlap;
+    int degree;
+    double likelihood_cost;
+  };
+
+  static size_t add_saturating(size_t a, size_t b) {
+    const size_t limit = std::numeric_limits<size_t>::max();
+    return b > limit - a ? limit : a + b;
+  }
+
+  const std::vector<std::vector<int>>& prepare_top_d2e(
+      const std::vector<uint64_t>& detections) {
+    if (!top_decoder_->config.sparsify_errors) {
+      return top_decoder_->d2e;
+    }
+    if (sparse_d2e_valid_ && sparse_d2e_detections_ == detections &&
+        sparse_d2e_reactivate_limit_ ==
+            top_decoder_->config.sparsify_reactivate_limit) {
+      return top_decoder_->sparse_d2e;
+    }
+
+    std::vector<uint8_t> shot_dets(top_decoder_->num_detectors, 0);
+    for (uint64_t detector : detections) {
+      shot_dets[detector] = 1;
+    }
+    std::fill(top_decoder_->sparse_error_active.begin(),
+              top_decoder_->sparse_error_active.end(), 0);
+    for (int error : top_decoder_->sparsify_mandatory_errors) {
+      top_decoder_->sparse_error_active[error] = 1;
+    }
+
+    std::vector<OptionalErrorCandidate> candidates;
+    candidates.reserve(top_decoder_->sparsify_optional_errors.size());
+    for (int error : top_decoder_->sparsify_optional_errors) {
+      int overlap = 0;
+      for (int detector : top_decoder_->errors[error].symptom.detectors) {
+        overlap += shot_dets[detector];
+      }
+      if (overlap > 0) {
+        candidates.push_back(
+            {error, overlap,
+             static_cast<int>(
+                 top_decoder_->errors[error].symptom.detectors.size()),
+             top_decoder_->errors[error].likelihood_cost});
+      }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const OptionalErrorCandidate& a,
+                 const OptionalErrorCandidate& b) {
+                if (a.overlap != b.overlap) return a.overlap > b.overlap;
+                if (a.degree != b.degree) return a.degree < b.degree;
+                if (a.likelihood_cost != b.likelihood_cost) {
+                  return a.likelihood_cost < b.likelihood_cost;
+                }
+                return a.error_index < b.error_index;
+              });
+
+    const size_t limit = std::min(
+        static_cast<size_t>(top_decoder_->config.sparsify_reactivate_limit),
+        candidates.size());
+    for (size_t k = 0; k < limit; ++k) {
+      top_decoder_->sparse_error_active[candidates[k].error_index] = 1;
+    }
+    for (size_t detector = 0; detector < top_decoder_->num_detectors;
+         ++detector) {
+      auto& sparse_errors = top_decoder_->sparse_d2e[detector];
+      sparse_errors.clear();
+      for (int error : top_decoder_->d2e[detector]) {
+        if (top_decoder_->sparse_error_active[error]) {
+          sparse_errors.push_back(error);
+        }
+      }
+    }
+    sparse_d2e_detections_ = detections;
+    sparse_d2e_reactivate_limit_ =
+        top_decoder_->config.sparsify_reactivate_limit;
+    sparse_d2e_valid_ = true;
+    return top_decoder_->sparse_d2e;
+  }
+
+  double initial_phase_cost(
+      TesseractDecoder& decoder, const boost::dynamic_bitset<>& state,
+      const std::vector<std::vector<int>>& active_d2e,
+      CompactPhaseWorkspace& workspace) {
+    std::fill(workspace.initial_cost_tuples.begin(),
+              workspace.initial_cost_tuples.end(), DetectorCostTuple{});
+    for (size_t detector = state.find_first();
+         detector != boost::dynamic_bitset<>::npos;
+         detector = state.find_next(detector)) {
+      for (int error : active_d2e[detector]) {
+        ++workspace.initial_cost_tuples[error].detectors_count;
+      }
+    }
+    double cost = 0;
+    for (size_t detector = state.find_first();
+         detector != boost::dynamic_bitset<>::npos;
+         detector = state.find_next(detector)) {
+      cost += decoder.get_detcost(detector, workspace.initial_cost_tuples,
+                                  active_d2e, decoder.edets);
+    }
+    return cost;
+  }
+
+  static std::vector<size_t> collect_chain_errors(
+      const TesseractDecoder& decoder, int64_t chain_index) {
+    std::vector<size_t> result;
+    while (chain_index != -1) {
+      const size_t error =
+          decoder.error_chain_arena[chain_index].error_index;
+      result.push_back(decoder.error_to_dem_error.at(error));
+      chain_index = decoder.error_chain_arena[chain_index].parent_idx;
+    }
+    std::reverse(result.begin(), result.end());
+    return result;
+  }
+
+  CompactOneWayTrialResult run_trial(
+      const boost::dynamic_bitset<>& top_state, double top_initial_cost,
+      const std::vector<std::vector<int>>& active_top_d2e,
+      size_t top_detector_order, size_t top_beam) {
+    CompactOneWayTrialResult best;
+    top_decoder_->error_chain_arena.clear();
+    size_t num_pq_pushed = 0;
+    bool pqlimit_hit = false;
+    bool top_completion_seen = false;
+    size_t continuation_window = 0;
+    size_t continuation_deadline = 0;
+
+    using CompletionHandler =
+        std::function<bool(const Node&, size_t)>;
+    using PhaseRunner = std::function<std::optional<Node>(
+        TesseractDecoder&, CompactPhaseWorkspace&,
+        const boost::dynamic_bitset<>&, double, size_t,
+        const std::vector<std::vector<int>>&, size_t, bool,
+        const CompletionHandler&)>;
+    PhaseRunner run_phase;
+
+    run_phase = [&](TesseractDecoder& decoder,
+                    CompactPhaseWorkspace& workspace,
+                    const boost::dynamic_bitset<>& initial_state,
+                    double initial_cost, size_t phase_beam,
+                    const std::vector<std::vector<int>>& active_d2e,
+                    size_t detector_order, bool is_top,
+                    const CompletionHandler& completion_handler)
+        -> std::optional<Node> {
+      if (initial_cost == INF) return std::nullopt;
+
+      std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
+      std::unordered_map<
+          size_t,
+          std::unordered_set<boost::dynamic_bitset<>, CompactBitsetHash>>
+          visited_detectors;
+      const size_t initial_num_dets = initial_state.count();
+      size_t min_num_dets = initial_num_dets;
+      size_t max_num_dets = std::min(
+          initial_state.size(), add_saturating(initial_num_dets, phase_beam));
+      pq.push({initial_cost, initial_num_dets, 0, -1});
+      ++num_pq_pushed;
+      if (num_pq_pushed > config_.pqlimit) {
+        pqlimit_hit = true;
+        return std::nullopt;
+      }
+
+      std::optional<Node> last_completion;
+      size_t phase_queue_pops = 0;
+      while (!pq.empty()) {
+        if (pqlimit_hit) return last_completion;
+        if (is_top && top_completion_seen &&
+            config_.continuation_factor > 0 &&
+            phase_queue_pops >= continuation_deadline) {
+          return last_completion;
+        }
+
+        const Node node = pq.top();
+        pq.pop();
+        ++phase_queue_pops;
+        if (config_.collect_stats) {
+          if (is_top) {
+            ++stats_.top_queue_pops;
+            if (top_completion_seen) {
+              ++stats_.continuation_top_queue_pops;
+            }
+          } else {
+            ++stats_.bottom_queue_pops;
+          }
+        }
+        if (node.num_dets > max_num_dets) continue;
+
+        workspace.detectors = initial_state;
+        std::fill(workspace.detector_cost_tuples.begin(),
+                  workspace.detector_cost_tuples.end(), DetectorCostTuple{});
+        decoder.flip_detectors_and_block_errors(
+            detector_order, node.error_chain_idx, workspace.detectors,
+            workspace.detector_cost_tuples, active_d2e, decoder.edets);
+
+        if (node.num_dets == 0) {
+          last_completion = node;
+          if (is_top && completion_handler(node, phase_queue_pops)) {
+            min_num_dets = 0;
+            max_num_dets = std::min(max_num_dets, phase_beam);
+            continue;
+          }
+          return node;
+        }
+
+        if (decoder.config.no_revisit_dets &&
+            !visited_detectors[node.num_dets]
+                 .insert(workspace.detectors)
+                 .second) {
+          continue;
+        }
+        if (config_.verbose) {
+          std::cout.precision(13);
+          std::cout << (is_top ? "GARI compact top" : "GARI compact bottom")
+                    << ": len(pq) = " << pq.size()
+                    << " num_pq_pushed = " << num_pq_pushed
+                    << " num_dets = " << node.num_dets
+                    << " max_num_dets = " << max_num_dets
+                    << " cost = " << node.cost << std::endl;
+        }
+
+        if (node.num_dets < min_num_dets) {
+          min_num_dets = node.num_dets;
+          const size_t new_max_num_dets =
+              std::min(initial_state.size(),
+                       add_saturating(min_num_dets, phase_beam));
+          if (decoder.config.no_revisit_dets) {
+            for (size_t count = new_max_num_dets + 1;
+                 count <= max_num_dets; ++count) {
+              visited_detectors[count].clear();
+            }
+          }
+          max_num_dets = std::min(max_num_dets, new_max_num_dets);
+        }
+
+        for (size_t detector = workspace.detectors.find_first();
+             detector != boost::dynamic_bitset<>::npos;
+             detector = workspace.detectors.find_next(detector)) {
+          for (int error : active_d2e[detector]) {
+            ++workspace.detector_cost_tuples[error].detectors_count;
+          }
+        }
+        workspace.next_detector_cost_tuples =
+            workspace.detector_cost_tuples;
+        workspace.next_detectors = workspace.detectors;
+
+        size_t min_detector = std::numeric_limits<size_t>::max();
+        for (size_t detector : decoder.config.det_orders[detector_order]) {
+          if (workspace.detectors[detector]) {
+            min_detector = detector;
+            break;
+          }
+        }
+        if (min_detector == std::numeric_limits<size_t>::max()) {
+          throw std::runtime_error(
+              "A nonempty compact GARI phase has no active detector pivot.");
+        }
+
+        size_t previous_error = std::numeric_limits<size_t>::max();
+        std::fill(workspace.detector_cost_cache.begin(),
+                  workspace.detector_cost_cache.end(), -1);
+        for (int error : active_d2e[min_detector]) {
+          if (workspace.detector_cost_tuples[error].error_blocked) continue;
+
+          if (previous_error != std::numeric_limits<size_t>::max()) {
+            for (int detector : decoder.edets[previous_error]) {
+              workspace.next_detectors[detector] =
+                  !workspace.next_detectors[detector];
+              const int fired = workspace.detectors[detector] ? 1 : -1;
+              for (int other_error : active_d2e[detector]) {
+                workspace.next_detector_cost_tuples[other_error]
+                    .detectors_count += fired;
+              }
+            }
+          }
+          previous_error = error;
+          workspace.next_detector_cost_tuples[error].error_blocked = 1;
+
+          double next_cost =
+              node.cost + decoder.errors[error].likelihood_cost;
+          size_t next_num_dets = node.num_dets;
+          for (int detector : decoder.edets[error]) {
+            workspace.next_detectors[detector] =
+                !workspace.next_detectors[detector];
+            const int fired = workspace.next_detectors[detector] ? 1 : -1;
+            next_num_dets += fired;
+            for (int other_error : active_d2e[detector]) {
+              workspace.next_detector_cost_tuples[other_error]
+                  .detectors_count += fired;
+            }
+          }
+          if (next_num_dets > max_num_dets) continue;
+          if (decoder.config.no_revisit_dets &&
+              visited_detectors[next_num_dets].contains(
+                  workspace.next_detectors)) {
+            continue;
+          }
+
+          for (int detector : decoder.edets[error]) {
+            if (workspace.detectors[detector]) {
+              if (workspace.detector_cost_cache[detector] == -1) {
+                workspace.detector_cost_cache[detector] = decoder.get_detcost(
+                    detector, workspace.detector_cost_tuples, active_d2e,
+                    decoder.edets);
+              }
+              next_cost -= workspace.detector_cost_cache[detector];
+            } else {
+              next_cost += decoder.get_detcost(
+                  detector, workspace.next_detector_cost_tuples, active_d2e,
+                  decoder.edets);
+            }
+          }
+          for (int detector : decoder.eneighbors[error]) {
+            if (!workspace.detectors[detector] ||
+                !workspace.next_detectors[detector]) {
+              continue;
+            }
+            if (workspace.detector_cost_cache[detector] == -1) {
+              workspace.detector_cost_cache[detector] = decoder.get_detcost(
+                  detector, workspace.detector_cost_tuples, active_d2e,
+                  decoder.edets);
+            }
+            next_cost -= workspace.detector_cost_cache[detector];
+            next_cost += decoder.get_detcost(
+                detector, workspace.next_detector_cost_tuples, active_d2e,
+                decoder.edets);
+          }
+          if (next_cost == INF) continue;
+
+          decoder.error_chain_arena.push_back(
+              {static_cast<size_t>(error), min_detector,
+               node.error_chain_idx});
+          const int64_t next_chain_index =
+              decoder.error_chain_arena.size() - 1;
+          pq.push({next_cost, next_num_dets, node.depth + 1,
+                   next_chain_index});
+          ++num_pq_pushed;
+          if (config_.collect_stats && !is_top) {
+            ++stats_.bottom_children_generated;
+            if (next_num_dets == node.num_dets) {
+              ++stats_.bottom_nonprogress_children_generated;
+            }
+          }
+          if (num_pq_pushed > config_.pqlimit) {
+            pqlimit_hit = true;
+            return last_completion;
+          }
+        }
+      }
+      return last_completion;
+    };
+
+    CompletionHandler handle_top_completion =
+        [&](const Node& top_solution, size_t top_queue_pops) {
+          const bool first_completion = !top_completion_seen;
+          if (config_.collect_stats) ++stats_.top_completions_seen;
+          debt_bits_.reset();
+          int64_t top_chain_index = top_solution.error_chain_idx;
+          while (top_chain_index != -1) {
+            const size_t retained_error =
+                top_decoder_->error_chain_arena[top_chain_index].error_index;
+            const size_t error =
+                top_decoder_->error_to_dem_error.at(retained_error);
+            const size_t detector =
+                prepared_model_->top_error_to_bottom_detector.at(error);
+            debt_bits_.flip(detector);
+            top_chain_index =
+                top_decoder_->error_chain_arena[top_chain_index].parent_idx;
+          }
+          std::vector<uint64_t> debt;
+          for (size_t detector = debt_bits_.find_first();
+               detector != boost::dynamic_bitset<>::npos;
+               detector = debt_bits_.find_next(detector)) {
+            debt.push_back(detector);
+          }
+
+          CompactBottomOutcome outcome;
+          if (debt.empty()) {
+            outcome.completed = true;
+            outcome.cost = 0;
+          } else {
+            if (config_.collect_stats) ++stats_.bottom_contexts_generated;
+            auto cached = bottom_cache_.find(debt);
+            if (cached != bottom_cache_.end()) {
+              outcome = cached->second;
+              if (config_.collect_stats) ++stats_.bottom_cache_hits;
+            } else {
+              const double bottom_initial_cost = initial_phase_cost(
+                  *bottom_decoder_, debt_bits_, bottom_decoder_->d2e,
+                  *bottom_workspace_);
+              if (bottom_initial_cost != INF) {
+                bottom_decoder_->error_chain_arena.clear();
+                const size_t bottom_pops_before = stats_.bottom_queue_pops;
+                const double committed_top_cost =
+                    prepared_model_->layout.prior_policy ==
+                            GariPriorPolicy::ModePR
+                        ? top_solution.cost
+                        : 0;
+                const CompletionHandler stop_at_first_bottom;
+                std::optional<Node> bottom_solution = run_phase(
+                    *bottom_decoder_, *bottom_workspace_, debt_bits_,
+                    committed_top_cost + bottom_initial_cost,
+                    config_.bottom_beam, bottom_decoder_->d2e,
+                    /*detector_order=*/0, /*is_top=*/false,
+                    stop_at_first_bottom);
+                if (config_.collect_stats &&
+                    stats_.bottom_queue_pops > bottom_pops_before) {
+                  ++stats_.bottom_contexts_explored;
+                  unique_bottom_debts_explored_.insert(debt);
+                  stats_.unique_bottom_debts_explored =
+                      unique_bottom_debts_explored_.size();
+                }
+                if (bottom_solution.has_value()) {
+                  outcome.completed = true;
+                  outcome.errors = collect_chain_errors(
+                      *bottom_decoder_,
+                      bottom_solution->error_chain_idx);
+                  outcome.cost = 0;
+                  for (size_t error : outcome.errors) {
+                    const size_t retained_error =
+                        bottom_decoder_->dem_error_to_error.at(error);
+                    const double cost =
+                        bottom_original_costs_by_error_.at(retained_error);
+                    if (!std::isfinite(cost)) {
+                      throw std::runtime_error(
+                          "A compact GARI bottom error has no original cost.");
+                    }
+                    outcome.cost += cost;
+                  }
+                }
+              }
+              if (outcome.completed) {
+                bottom_cache_.emplace(debt, outcome);
+              }
+            }
+          }
+
+          if (outcome.completed && outcome.cost < best.physical_cost) {
+            best.completed = true;
+            best.physical_cost = outcome.cost;
+            best.top_errors = collect_chain_errors(
+                *top_decoder_, top_solution.error_chain_idx);
+            best.physical_errors = outcome.errors;
+          }
+          const bool improved_shot =
+              outcome.completed && outcome.cost < physical_incumbent_;
+          if (improved_shot) physical_incumbent_ = outcome.cost;
+
+          if (first_completion) {
+            top_completion_seen = true;
+            if (config_.continuation_factor <= 0 || pqlimit_hit) return false;
+            const long double scaled = std::ceil(
+                static_cast<long double>(config_.continuation_factor) *
+                top_queue_pops);
+            continuation_window =
+                scaled >= static_cast<long double>(
+                              std::numeric_limits<size_t>::max())
+                    ? std::numeric_limits<size_t>::max()
+                    : std::max<size_t>(1, static_cast<size_t>(scaled));
+            continuation_deadline =
+                add_saturating(top_queue_pops, continuation_window);
+            return true;
+          }
+          if (improved_shot) {
+            continuation_deadline =
+                add_saturating(top_queue_pops, continuation_window);
+            if (config_.collect_stats) {
+              ++stats_.continuation_physical_improvements;
+            }
+          }
+          return !pqlimit_hit;
+        };
+
+    std::optional<Node> top_solution = run_phase(
+        *top_decoder_, *top_workspace_, top_state, top_initial_cost, top_beam,
+        active_top_d2e, top_detector_order, /*is_top=*/true,
+        handle_top_completion);
+    if (config_.collect_stats && pqlimit_hit) {
+      ++stats_.pqlimit_truncated_trials;
+    }
+    if ((!top_solution.has_value() || !best.completed) && config_.verbose &&
+        !pqlimit_hit) {
+      std::cout << (top_solution.has_value()
+                        ? "GARI compact bottom search failed to converge."
+                        : "GARI compact top search failed to converge.")
+                << std::endl;
+    }
+    return best;
+  }
+
+  std::shared_ptr<const GariTwoStagePreparedModel> prepared_model_;
+  GariMonolithicOneWayDecoderConfig config_;
+  std::unique_ptr<TesseractDecoder> top_decoder_;
+  std::unique_ptr<TesseractDecoder> bottom_decoder_;
+  std::unique_ptr<CompactPhaseWorkspace> top_workspace_;
+  std::unique_ptr<CompactPhaseWorkspace> bottom_workspace_;
+  std::vector<double> bottom_original_costs_by_error_;
+  boost::dynamic_bitset<> debt_bits_;
+  std::unordered_map<std::vector<uint64_t>, CompactBottomOutcome, VectorHash>
+      bottom_cache_;
+  std::unordered_set<std::vector<uint64_t>, VectorHash>
+      unique_bottom_debts_explored_;
+  GariMonolithicOneWayStats stats_;
+  double physical_incumbent_ = std::numeric_limits<double>::infinity();
+  bool sparse_d2e_valid_ = false;
+  int sparse_d2e_reactivate_limit_ = -1;
+  std::vector<uint64_t> sparse_d2e_detections_;
+};
+
+GariMonolithicOneWayTesseractDecoder::
+    GariMonolithicOneWayTesseractDecoder(
+        std::shared_ptr<const GariTwoStagePreparedModel> prepared_model,
+        GariMonolithicOneWayDecoderConfig config)
+    : prepared_model_(std::move(prepared_model)) {
+  impl_ = std::make_unique<Impl>(prepared_model_, std::move(config));
+}
+
+GariMonolithicOneWayTesseractDecoder::~GariMonolithicOneWayTesseractDecoder() =
+    default;
+
+GariMonolithicOneWayDecodeResult
+GariMonolithicOneWayTesseractDecoder::decode(
+    const std::vector<uint64_t>& top_detections) {
+  return impl_->decode(top_detections);
+}
+
+const stim::DetectorErrorModel&
+GariMonolithicOneWayTesseractDecoder::compact_top_dem() const {
+  return prepared_model_->top_dem;
+}
+
+const stim::DetectorErrorModel&
+GariMonolithicOneWayTesseractDecoder::compact_bottom_dem() const {
+  return prepared_model_->bottom_dem;
+}
+
+const std::vector<std::vector<size_t>>&
+GariMonolithicOneWayTesseractDecoder::top_detector_orders() const {
+  return impl_->top_decoder().config.det_orders;
+}
+
+size_t GariMonolithicOneWayTesseractDecoder::compact_top_detector_count()
+    const {
+  return impl_->top_decoder().num_detectors;
+}
+
+size_t GariMonolithicOneWayTesseractDecoder::compact_top_error_count() const {
+  return impl_->top_decoder().num_errors;
+}
+
+size_t GariMonolithicOneWayTesseractDecoder::compact_bottom_detector_count()
+    const {
+  return impl_->bottom_decoder().num_detectors;
+}
+
+size_t GariMonolithicOneWayTesseractDecoder::compact_bottom_error_count() const {
+  return impl_->bottom_decoder().num_errors;
+}
+
+bool GariMonolithicOneWayTesseractDecoder::top_no_revisit_dets_enabled()
+    const {
+  return impl_->top_decoder().config.no_revisit_dets;
+}
+
+bool GariMonolithicOneWayTesseractDecoder::bottom_no_revisit_dets_enabled()
+    const {
+  return impl_->bottom_decoder().config.no_revisit_dets;
+}
+
+bool GariMonolithicOneWayTesseractDecoder::top_merge_errors_enabled() const {
+  return impl_->top_decoder().config.merge_errors;
+}
+
+bool GariMonolithicOneWayTesseractDecoder::bottom_merge_errors_enabled() const {
+  return impl_->bottom_decoder().config.merge_errors;
+}
+
+int GariMonolithicOneWayTesseractDecoder::top_sparsify_reactivate_limit()
+    const {
+  return impl_->top_decoder().config.sparsify_reactivate_limit;
 }

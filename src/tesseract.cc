@@ -95,17 +95,6 @@ std::string TesseractConfig::str() {
   ss << "det_orders=" << config.det_orders << ", ";
   ss << "det_penalty=" << config.det_penalty << ", ";
   ss << "create_visualization=" << config.create_visualization;
-  if (config.gari_monolithic_one_way.has_value()) {
-    ss << ", gari_monolithic_one_way=true";
-    if (config.gari_monolithic_one_way->bottom_beam < INF_DET_BEAM) {
-      ss << ", gari_monolithic_bottom_beam="
-         << config.gari_monolithic_one_way->bottom_beam;
-    }
-    if (config.gari_monolithic_one_way->continuation_factor > 0) {
-      ss << ", gari_monolithic_continuation_factor="
-         << config.gari_monolithic_one_way->continuation_factor;
-    }
-  }
   ss << ")";
   return ss.str();
 }
@@ -188,77 +177,6 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
   dem_error_to_error = std::move(dem_error_map);
   error_to_dem_error = common::invert_error_map(dem_error_to_error, config.dem.count_errors());
 
-  beam_detector_count = config.dem.count_detectors();
-  if (config.gari_monolithic_one_way.has_value()) {
-    gari_monolithic_one_way_enabled = true;
-    const auto& one_way = *config.gari_monolithic_one_way;
-    if (one_way.real_detector_count > config.dem.count_detectors()) {
-      throw std::invalid_argument(
-          "GARI real_detector_count cannot exceed the DEM detector count.");
-    }
-    if (one_way.physical_error_count > dem_error_to_error.size()) {
-      throw std::invalid_argument(
-          "GARI physical_error_count cannot exceed the original DEM error count.");
-    }
-    if (!one_way.original_physical_costs.empty() &&
-        one_way.original_physical_costs.size() != one_way.physical_error_count) {
-      throw std::invalid_argument(
-          "GARI original physical cost count must equal physical_error_count.");
-    }
-    if (!std::isfinite(one_way.continuation_factor) ||
-        one_way.continuation_factor < 0) {
-      throw std::invalid_argument(
-          "GARI continuation_factor must be finite and nonnegative.");
-    }
-    beam_detector_count = one_way.real_detector_count;
-
-    error_is_physical.resize(config.dem.count_errors());
-    for (size_t error_index = 0; error_index < error_to_dem_error.size(); ++error_index) {
-      size_t original_error_index = error_to_dem_error[error_index];
-      if (original_error_index == std::numeric_limits<size_t>::max()) {
-        throw std::runtime_error("A retained decoder error has no original DEM error mapping.");
-      }
-      error_is_physical[error_index] =
-          original_error_index < one_way.physical_error_count;
-    }
-    for (size_t original_error_index = 0; original_error_index < dem_error_to_error.size();
-         ++original_error_index) {
-      size_t error_index = dem_error_to_error[original_error_index];
-      if (error_index == std::numeric_limits<size_t>::max()) {
-        continue;
-      }
-      bool original_is_physical = original_error_index < one_way.physical_error_count;
-      if (error_is_physical[error_index] != original_is_physical) {
-        throw std::invalid_argument(
-            "GARI preprocessing merged physical and barred errors across the configured error "
-            "boundary.");
-      }
-    }
-    if (!one_way.original_physical_costs.empty()) {
-      const double unset_cost = std::numeric_limits<double>::quiet_NaN();
-      gari_original_physical_costs_by_error.assign(config.dem.count_errors(), unset_cost);
-      for (size_t original_error_index = 0;
-           original_error_index < one_way.physical_error_count;
-           ++original_error_index) {
-        const double original_cost =
-            one_way.original_physical_costs[original_error_index];
-        if (!std::isfinite(original_cost)) {
-          throw std::invalid_argument(
-              "GARI original physical costs must be finite.");
-        }
-        const size_t error_index = dem_error_to_error[original_error_index];
-        if (error_index == std::numeric_limits<size_t>::max()) {
-          continue;
-        }
-        double& retained_cost =
-            gari_original_physical_costs_by_error[error_index];
-        retained_cost = std::isnan(retained_cost)
-                            ? original_cost
-                            : common::merge_weights(retained_cost, original_cost);
-      }
-    }
-  }
-
   if (config.det_orders.empty()) {
     config.det_orders.emplace_back(config.dem.count_detectors());
     std::iota(config.det_orders[0].begin(), config.det_orders[0].end(), 0);
@@ -270,53 +188,10 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
       }
     }
   }
-  if (config.gari_monolithic_one_way.has_value()) {
-    const size_t real_detector_count =
-        config.gari_monolithic_one_way->real_detector_count;
-    for (const auto& detector_order : config.det_orders) {
-      std::vector<uint8_t> real_seen(real_detector_count);
-      for (size_t i = 0; i < real_detector_count; ++i) {
-        size_t detector = detector_order[i];
-        if (detector >= real_detector_count || real_seen[detector]) {
-          throw std::invalid_argument(
-              "Each GARI monolithic one-way detector order must begin with every real detector "
-              "exactly once.");
-        }
-        real_seen[detector] = 1;
-      }
-      for (size_t i = real_detector_count; i < detector_order.size(); ++i) {
-        if (detector_order[i] != i) {
-          throw std::invalid_argument(
-              "Each GARI monolithic one-way detector order must end with virtual detectors in "
-              "natural order.");
-        }
-      }
-    }
-  }
   if (config.det_orders.empty()) {
     throw std::runtime_error("After initialization, detector orders list must not be empty.");
   }
   errors = get_errors_from_dem(config.dem.flattened());
-  if (gari_monolithic_one_way_enabled) {
-    for (size_t ei = 0; ei < errors.size(); ++ei) {
-      bool touches_real = false;
-      bool touches_virtual = false;
-      for (int detector : errors[ei].symptom.detectors) {
-        touches_real |= detector < beam_detector_count;
-        touches_virtual |= detector >= beam_detector_count;
-      }
-      if (error_is_physical[ei]) {
-        if (touches_real || !touches_virtual) {
-          throw std::invalid_argument(
-              "A physical GARI error must target virtual detectors only.");
-        }
-      } else if (!touches_real || !touches_virtual ||
-                 !errors[ei].symptom.observables.empty()) {
-        throw std::invalid_argument(
-            "A barred GARI error must connect real and virtual detectors without observables.");
-      }
-    }
-  }
   if (config.verbose) {
     for (auto& error : errors) {
       std::cout << error.str() << "\n";
@@ -337,29 +212,11 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
 void TesseractDecoder::initialize_structures(size_t num_detectors) {
   d2e.resize(num_detectors);
   edets.resize(num_errors);
-  if (gari_monolithic_one_way_enabled) {
-    beam_edets.resize(num_errors);
-    top_error_indices.reserve(num_errors);
-    bottom_error_indices.reserve(num_errors);
-    for (size_t ei = 0; ei < num_errors; ++ei) {
-      (error_is_physical[ei] ? bottom_error_indices : top_error_indices).push_back(ei);
-    }
-    gari_initial_cost_tuples.resize(num_errors);
-    gari_detector_cost_tuples.resize(num_errors);
-    gari_next_detector_cost_tuples.resize(num_errors);
-    gari_detector_cost_cache.resize(num_detectors);
-  }
 
   for (size_t ei = 0; ei < num_errors; ++ei) {
     edets[ei] = errors[ei].symptom.detectors;
     for (int d : edets[ei]) {
-      if (!gari_monolithic_one_way_enabled || d < beam_detector_count ||
-          error_is_physical[ei]) {
-        d2e[d].push_back(ei);
-      }
-      if (gari_monolithic_one_way_enabled && d < beam_detector_count) {
-        beam_edets[ei].push_back(d);
-      }
+      d2e[d].push_back(ei);
     }
   }
 
@@ -370,43 +227,11 @@ void TesseractDecoder::initialize_structures(size_t num_detectors) {
 
   for (size_t d = 0; d < num_detectors; ++d) {
     std::sort(d2e[d].begin(), d2e[d].end(),
-              [this, d](size_t idx_a, size_t idx_b) {
-                if (gari_monolithic_one_way_enabled && d < beam_detector_count) {
-                  const double cost_a =
-                      errors[idx_a].likelihood_cost / beam_edets[idx_a].size();
-                  const double cost_b =
-                      errors[idx_b].likelihood_cost / beam_edets[idx_b].size();
-                  return cost_a < cost_b;
-                }
+              [this](size_t idx_a, size_t idx_b) {
                 const double cost_a = error_costs[idx_a].min_cost;
                 const double cost_b = error_costs[idx_b].min_cost;
                 return cost_a < cost_b;
               });
-  }
-
-  if (gari_monolithic_one_way_enabled) {
-    top_eneighbors.resize(num_errors);
-    std::vector<boost::dynamic_bitset<>> top_edets_bitsets(
-        num_errors, boost::dynamic_bitset<>(beam_detector_count));
-    for (size_t ei = 0; ei < num_errors; ++ei) {
-      for (int d : beam_edets[ei]) {
-        top_edets_bitsets[ei][d] = 1;
-      }
-    }
-    for (size_t ei = 0; ei < num_errors; ++ei) {
-      if (beam_edets[ei].empty()) continue;
-      boost::dynamic_bitset<> neighbor_set(beam_detector_count);
-      for (int d : beam_edets[ei]) {
-        for (int oei : d2e[d]) {
-          neighbor_set |= top_edets_bitsets[oei];
-        }
-      }
-      neighbor_set &= ~top_edets_bitsets[ei];
-      for (size_t d = neighbor_set.find_first(); d != boost::dynamic_bitset<>::npos;
-           d = neighbor_set.find_next(d)) {
-        top_eneighbors[ei].push_back(d);
-      }
-    }
   }
 
   eneighbors.resize(num_errors);
@@ -455,23 +280,15 @@ void TesseractDecoder::initialize_structures(size_t num_detectors) {
     if (config.sparsify_reactivate_limit == -1) {
       int error_count_limit = static_cast<int>(
           std::min(num_errors, static_cast<size_t>(std::numeric_limits<int>::max())));
-      const size_t sparsify_detector_count =
-          gari_monolithic_one_way_enabled ? beam_detector_count : config.dem.count_detectors();
       config.sparsify_reactivate_limit = suggest_sparsify_reactivate_limit_capped(
-          sparsify_detector_count, config.sparsify_base_degree, error_count_limit);
+          config.dem.count_detectors(), config.sparsify_base_degree, error_count_limit);
     }
 
     sparsify_mandatory_errors.clear();
     sparsify_optional_errors.clear();
     for (size_t ei = 0; ei < num_errors; ++ei) {
-      int degree =
-          gari_monolithic_one_way_enabled && !error_is_physical[ei]
-              ? static_cast<int>(beam_edets[ei].size())
-              : static_cast<int>(errors[ei].symptom.detectors.size());
-      // Bottom columns never overlap the initial real-only syndrome, so retain
-      // all of them while sparsifying the barred/top portion of a one-way model.
-      if ((gari_monolithic_one_way_enabled && error_is_physical[ei]) ||
-          degree <= config.sparsify_base_degree) {
+      int degree = static_cast<int>(errors[ei].symptom.detectors.size());
+      if (degree <= config.sparsify_base_degree) {
         sparsify_mandatory_errors.push_back(ei);
       } else if (degree > config.sparsify_base_degree &&
                  (config.sparsify_max_degree == -1 || degree <= config.sparsify_max_degree)) {
@@ -484,7 +301,6 @@ void TesseractDecoder::initialize_structures(size_t num_detectors) {
 }
 
 void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections) {
-  reset_gari_monolithic_one_way_stats();
   if (config.sparsify_errors) {
     build_sparse_d2e(detections);
   }
@@ -564,7 +380,6 @@ void TesseractDecoder::flip_detectors_and_block_errors(
 
 void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections,
                                         size_t detector_order, size_t detector_beam) {
-  reset_gari_monolithic_one_way_stats();
   if (config.sparsify_errors) {
     build_sparse_d2e(detections);
   }
@@ -575,7 +390,6 @@ void TesseractDecoder::decode_to_errors(const std::vector<uint64_t>& detections,
 std::vector<std::vector<size_t>> TesseractDecoder::decode_to_error_candidates(
     const std::vector<uint64_t>& detections, size_t detector_order, size_t detector_beam,
     size_t max_candidates) {
-  reset_gari_monolithic_one_way_stats();
   if (max_candidates == 0) {
     throw std::invalid_argument("max_candidates must be at least 1.");
   }
@@ -593,12 +407,6 @@ void TesseractDecoder::decode_to_errors_with_graph(
     const std::vector<uint64_t>& detections, size_t detector_order, size_t detector_beam,
     const std::vector<std::vector<int>>& active_d2e, size_t max_candidates,
     std::vector<std::vector<size_t>>* candidates) {
-  if (gari_monolithic_one_way_enabled) {
-    decode_gari_monolithic_one_way_with_graph(detections, detector_order, detector_beam,
-                                               active_d2e, candidates);
-    return;
-  }
-
   predicted_errors_buffer.clear();
   low_confidence_flag = false;
   error_chain_arena.clear();
@@ -869,480 +677,6 @@ void TesseractDecoder::decode_to_errors_with_graph(
   low_confidence_flag = candidates == nullptr || candidates->empty();
 }
 
-void TesseractDecoder::decode_gari_monolithic_one_way_with_graph(
-    const std::vector<uint64_t>& detections, size_t detector_order, size_t detector_beam,
-    const std::vector<std::vector<int>>& active_d2e, std::vector<std::vector<size_t>>* candidates) {
-  predicted_errors_buffer.clear();
-  low_confidence_flag = false;
-  error_chain_arena.clear();
-  if (config.pqlimit != std::numeric_limits<size_t>::max()) {
-    error_chain_arena.reserve(config.pqlimit);
-  }
-
-  for (size_t d : detections) {
-    if (d >= beam_detector_count) {
-      throw std::invalid_argument(
-          "GARI monolithic one-way decoding accepts detections only on real detectors.");
-    }
-  }
-  if (detections.empty()) {
-    if (candidates != nullptr) {
-      candidates->push_back({});
-    }
-    return;
-  }
-
-  const auto& one_way_config = *config.gari_monolithic_one_way;
-  const bool collect_stats = one_way_config.collect_stats;
-  const bool continuation_enabled = one_way_config.continuation_factor > 0;
-  size_t num_pq_pushed = 0;
-  bool pqlimit_hit = false;
-  auto& initial_cost_tuples = gari_initial_cost_tuples;
-  auto& detector_cost_tuples = gari_detector_cost_tuples;
-  auto& next_detector_cost_tuples = gari_next_detector_cost_tuples;
-  auto& detector_cost_cache = gari_detector_cost_cache;
-
-  auto initial_phase_cost = [&](const boost::dynamic_bitset<>& state,
-                                const std::vector<std::vector<int>>& state_edets,
-                                const std::vector<size_t>& phase_error_indices) {
-    for (size_t ei : phase_error_indices) {
-      initial_cost_tuples[ei] = {};
-    }
-    for (size_t d = state.find_first(); d != boost::dynamic_bitset<>::npos;
-         d = state.find_next(d)) {
-      for (int ei : active_d2e[d]) {
-        ++initial_cost_tuples[ei].detectors_count;
-      }
-    }
-    double cost = 0;
-    for (size_t d = state.find_first(); d != boost::dynamic_bitset<>::npos;
-         d = state.find_next(d)) {
-      cost += get_detcost(d, initial_cost_tuples, active_d2e, state_edets);
-    }
-    return cost;
-  };
-
-  auto collect_chain_errors = [&](int64_t chain_idx, int64_t stop_before_chain_idx) {
-    std::vector<size_t> result;
-    while (chain_idx != stop_before_chain_idx) {
-      result.push_back(
-          error_to_dem_error[error_chain_arena[chain_idx].error_index]);
-      chain_idx = error_chain_arena[chain_idx].parent_idx;
-    }
-    std::reverse(result.begin(), result.end());
-    return result;
-  };
-
-  auto add_saturating = [](size_t a, size_t b) {
-    const size_t limit = std::numeric_limits<size_t>::max();
-    return b > limit - a ? limit : a + b;
-  };
-  auto continuation_window_for = [&](size_t first_completion_pops) {
-    const long double scaled =
-        std::ceil(static_cast<long double>(one_way_config.continuation_factor) *
-                  first_completion_pops);
-    if (scaled >=
-        static_cast<long double>(std::numeric_limits<size_t>::max())) {
-      return std::numeric_limits<size_t>::max();
-    }
-    return std::max<size_t>(1, static_cast<size_t>(scaled));
-  };
-
-  std::vector<size_t> best_completed_errors;
-  double best_physical_cost = std::numeric_limits<double>::max();
-  bool completed_candidate_found = false;
-  bool top_completion_seen = false;
-  size_t continuation_window = 0;
-  size_t continuation_deadline = 0;
-
-  using PhaseRunner = std::function<std::optional<Node>(
-      const boost::dynamic_bitset<>&, double, size_t,
-      const std::vector<std::vector<int>>&,
-      const std::vector<std::vector<int>>&,
-      const std::vector<size_t>&, size_t, size_t, int64_t, size_t, int64_t,
-      bool)>;
-  PhaseRunner run_phase;
-  std::function<bool(const Node&, size_t)> handle_top_completion;
-
-  run_phase = [&](const boost::dynamic_bitset<>& initial_state, double initial_cost,
-                  size_t phase_beam, const std::vector<std::vector<int>>& state_edets,
-                  const std::vector<std::vector<int>>& state_neighbors,
-                  const std::vector<size_t>& phase_error_indices,
-                  size_t detector_order_begin, size_t detector_order_end,
-                  int64_t chain_stop, size_t initial_depth,
-                  int64_t initial_chain_idx, bool is_top) -> std::optional<Node> {
-    if (initial_cost == INF) {
-      return std::nullopt;
-    }
-
-    std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
-    std::unordered_map<size_t, std::unordered_set<boost::dynamic_bitset<>>> visited_detectors;
-    const size_t initial_num_dets = initial_state.count();
-    size_t min_num_dets = initial_num_dets;
-    size_t max_num_dets = std::min(initial_state.size(), initial_num_dets + phase_beam);
-    pq.push({initial_cost, initial_num_dets, initial_depth, initial_chain_idx});
-    ++num_pq_pushed;
-    if (num_pq_pushed > config.pqlimit) {
-      pqlimit_hit = true;
-      return std::nullopt;
-    }
-
-    boost::dynamic_bitset<> detectors(initial_state.size());
-    boost::dynamic_bitset<> next_detectors(initial_state.size());
-    std::optional<Node> last_completion;
-    size_t phase_queue_pops = 0;
-
-    while (!pq.empty()) {
-      if (pqlimit_hit) {
-        return last_completion;
-      }
-      if (is_top && top_completion_seen && continuation_enabled &&
-          phase_queue_pops >= continuation_deadline) {
-        return last_completion;
-      }
-
-      const Node node = pq.top();
-      pq.pop();
-      ++phase_queue_pops;
-      if (collect_stats) {
-        if (is_top) {
-          ++gari_monolithic_one_way_stats.top_queue_pops;
-          if (top_completion_seen) {
-            ++gari_monolithic_one_way_stats.continuation_top_queue_pops;
-          }
-        } else {
-          ++gari_monolithic_one_way_stats.bottom_queue_pops;
-        }
-      }
-      if (node.num_dets > max_num_dets) continue;
-
-      detectors = initial_state;
-      for (size_t ei : phase_error_indices) {
-        detector_cost_tuples[ei] = {};
-      }
-      flip_detectors_and_block_errors(detector_order, node.error_chain_idx, detectors,
-                                      detector_cost_tuples, active_d2e, state_edets, chain_stop);
-
-      if (node.num_dets == 0) {
-        last_completion = node;
-        if (config.create_visualization) {
-          boost::dynamic_bitset<> full_detectors(num_detectors);
-          for (size_t d = detectors.find_first(); d != boost::dynamic_bitset<>::npos;
-               d = detectors.find_next(d)) {
-            full_detectors[d] = 1;
-          }
-          visualizer.add_activated_errors(node.error_chain_idx, error_chain_arena);
-          visualizer.add_activated_detectors(full_detectors, num_detectors);
-        }
-        if (is_top && handle_top_completion(node, phase_queue_pops)) {
-          min_num_dets = 0;
-          max_num_dets = std::min(max_num_dets, phase_beam);
-          continue;
-        }
-        return node;
-      }
-
-      if (config.no_revisit_dets && !visited_detectors[node.num_dets].insert(detectors).second) {
-        continue;
-      }
-
-      if (config.create_visualization) {
-        boost::dynamic_bitset<> full_detectors(num_detectors);
-        for (size_t d = detectors.find_first(); d != boost::dynamic_bitset<>::npos;
-             d = detectors.find_next(d)) {
-          full_detectors[d] = 1;
-        }
-        visualizer.add_activated_errors(node.error_chain_idx, error_chain_arena);
-        visualizer.add_activated_detectors(full_detectors, num_detectors);
-      }
-      if (config.verbose) {
-        std::cout.precision(13);
-        std::cout << (is_top ? "GARI top" : "GARI bottom") << ": len(pq) = " << pq.size()
-                  << " num_pq_pushed = " << num_pq_pushed << " num_dets = " << node.num_dets
-                  << " max_num_dets = " << max_num_dets << " cost = " << node.cost << std::endl;
-      }
-
-      if (node.num_dets < min_num_dets) {
-        min_num_dets = node.num_dets;
-        const size_t new_max_num_dets = std::min(initial_state.size(), min_num_dets + phase_beam);
-        if (config.no_revisit_dets) {
-          for (size_t i = new_max_num_dets + 1; i <= max_num_dets; ++i) {
-            visited_detectors[i].clear();
-          }
-        }
-        max_num_dets = std::min(max_num_dets, new_max_num_dets);
-      }
-
-      for (size_t d = detectors.find_first(); d != boost::dynamic_bitset<>::npos;
-           d = detectors.find_next(d)) {
-        for (int ei : active_d2e[d]) {
-          ++detector_cost_tuples[ei].detectors_count;
-        }
-      }
-      for (size_t ei : phase_error_indices) {
-        next_detector_cost_tuples[ei] = detector_cost_tuples[ei];
-      }
-      next_detectors = detectors;
-
-      size_t min_detector = std::numeric_limits<size_t>::max();
-      for (size_t i = detector_order_begin; i < detector_order_end; ++i) {
-        const size_t d = config.det_orders[detector_order][i];
-        if (d < detectors.size() && detectors[d]) {
-          min_detector = d;
-          break;
-        }
-      }
-      if (min_detector == std::numeric_limits<size_t>::max()) {
-        throw std::runtime_error("A nonempty GARI phase has no active detector pivot.");
-      }
-
-      size_t prev_ei = std::numeric_limits<size_t>::max();
-      std::fill(detector_cost_cache.begin() + detector_order_begin,
-                detector_cost_cache.begin() + detector_order_end, -1);
-      for (int ei : active_d2e[min_detector]) {
-        if (is_top == static_cast<bool>(error_is_physical[ei])) {
-          throw std::runtime_error("A GARI phase exposed an error from the other phase.");
-        }
-        if (detector_cost_tuples[ei].error_blocked) continue;
-
-        if (prev_ei != std::numeric_limits<size_t>::max()) {
-          for (int d : state_edets[prev_ei]) {
-            next_detectors[d] = !next_detectors[d];
-            const int fired = detectors[d] ? 1 : -1;
-            for (int oei : active_d2e[d]) {
-              next_detector_cost_tuples[oei].detectors_count += fired;
-            }
-          }
-        }
-        prev_ei = ei;
-        next_detector_cost_tuples[ei].error_blocked = 1;
-
-        double next_cost = node.cost + errors[ei].likelihood_cost;
-        size_t next_num_dets = node.num_dets;
-        for (int d : state_edets[ei]) {
-          next_detectors[d] = !next_detectors[d];
-          const int fired = next_detectors[d] ? 1 : -1;
-          next_num_dets += fired;
-          for (int oei : active_d2e[d]) {
-            next_detector_cost_tuples[oei].detectors_count += fired;
-          }
-        }
-
-        if (next_num_dets > max_num_dets) continue;
-        if (config.no_revisit_dets && visited_detectors[next_num_dets].find(next_detectors) !=
-                                          visited_detectors[next_num_dets].end()) {
-          continue;
-        }
-
-        for (int d : state_edets[ei]) {
-          if (detectors[d]) {
-            if (detector_cost_cache[d] == -1) {
-              detector_cost_cache[d] =
-                  get_detcost(d, detector_cost_tuples, active_d2e, state_edets);
-            }
-            next_cost -= detector_cost_cache[d];
-          } else {
-            next_cost += get_detcost(d, next_detector_cost_tuples, active_d2e, state_edets);
-          }
-        }
-        for (int d : state_neighbors[ei]) {
-          if (!detectors[d] || !next_detectors[d]) continue;
-          if (detector_cost_cache[d] == -1) {
-            detector_cost_cache[d] = get_detcost(d, detector_cost_tuples, active_d2e, state_edets);
-          }
-          next_cost -= detector_cost_cache[d];
-          next_cost += get_detcost(d, next_detector_cost_tuples, active_d2e, state_edets);
-        }
-        if (next_cost == INF) continue;
-
-        error_chain_arena.push_back({static_cast<size_t>(ei), min_detector, node.error_chain_idx});
-        const int64_t next_chain_idx = error_chain_arena.size() - 1;
-        pq.push({next_cost, next_num_dets, node.depth + 1, next_chain_idx});
-        ++num_pq_pushed;
-        if (collect_stats && !is_top) {
-          ++gari_monolithic_one_way_stats.bottom_children_generated;
-          if (next_num_dets == node.num_dets) {
-            ++gari_monolithic_one_way_stats.bottom_nonprogress_children_generated;
-          }
-        }
-        if (num_pq_pushed > config.pqlimit) {
-          pqlimit_hit = true;
-          return last_completion;
-        }
-      }
-    }
-    return last_completion;
-  };
-
-  handle_top_completion = [&](const Node& top_solution, size_t top_queue_pops) {
-    const bool is_first_completion = !top_completion_seen;
-    if (collect_stats) {
-      ++gari_monolithic_one_way_stats.top_completions_seen;
-    }
-
-    std::vector<size_t> top_errors =
-        collect_chain_errors(top_solution.error_chain_idx, -1);
-
-    // Debt is deliberately absent from every queued top state. Materialize it
-    // only when the projected real residual reaches zero.
-    boost::dynamic_bitset<> bottom_state(num_detectors);
-    for (size_t d : detections) {
-      bottom_state[d] = 1;
-    }
-    int64_t walker_idx = top_solution.error_chain_idx;
-    while (walker_idx != -1) {
-      const size_t ei = error_chain_arena[walker_idx].error_index;
-      for (int d : edets[ei]) {
-        bottom_state[d] = !bottom_state[d];
-      }
-      walker_idx = error_chain_arena[walker_idx].parent_idx;
-    }
-    for (size_t d = bottom_state.find_first();
-         d != boost::dynamic_bitset<>::npos && d < beam_detector_count;
-         d = bottom_state.find_next(d)) {
-      throw std::runtime_error(
-          "A completed projected GARI top state left a real residual.");
-    }
-
-    bool bottom_completed = true;
-    std::vector<size_t> physical_errors;
-    double physical_cost = 0;
-    if (bottom_state.any()) {
-      if (collect_stats) {
-        ++gari_monolithic_one_way_stats.bottom_contexts_generated;
-      }
-      boost::dynamic_bitset<> debt(num_detectors - beam_detector_count);
-      for (size_t d = beam_detector_count; d < num_detectors; ++d) {
-        debt[d - beam_detector_count] = bottom_state[d];
-      }
-
-      auto cached = gari_bottom_cache.find(debt);
-      if (cached != gari_bottom_cache.end()) {
-        physical_errors = cached->second.physical_errors;
-        physical_cost = cached->second.physical_cost;
-        if (collect_stats) {
-          ++gari_monolithic_one_way_stats.bottom_cache_hits;
-        }
-      } else {
-        const double bottom_residual_initial_cost =
-            initial_phase_cost(bottom_state, edets, bottom_error_indices);
-        if (bottom_residual_initial_cost == INF) {
-          bottom_completed = false;
-        } else {
-          // A nested bottom search may append many temporary error-chain
-          // nodes. Copy its portable result, then reclaim that suffix before
-          // resuming the still-live top queue.
-          const size_t arena_checkpoint = error_chain_arena.size();
-          const size_t bottom_pops_before =
-              gari_monolithic_one_way_stats.bottom_queue_pops;
-          const double committed_top_guide_cost =
-              one_way_config.original_physical_costs.empty()
-                  ? 0
-                  : top_solution.cost;
-          std::optional<Node> bottom_solution = run_phase(
-              bottom_state,
-              committed_top_guide_cost + bottom_residual_initial_cost,
-              one_way_config.bottom_beam,
-              edets, eneighbors, bottom_error_indices, beam_detector_count,
-              num_detectors, top_solution.error_chain_idx, top_solution.depth,
-              top_solution.error_chain_idx, false);
-          if (collect_stats &&
-              gari_monolithic_one_way_stats.bottom_queue_pops >
-                  bottom_pops_before) {
-            ++gari_monolithic_one_way_stats.bottom_contexts_explored;
-            unique_bottom_debts_explored.insert(debt);
-            gari_monolithic_one_way_stats.unique_bottom_debts_explored =
-                unique_bottom_debts_explored.size();
-          }
-          if (bottom_solution.has_value()) {
-            physical_errors = collect_chain_errors(
-                bottom_solution->error_chain_idx, top_solution.error_chain_idx);
-            physical_cost = solution_cost_from_errors(physical_errors);
-            gari_bottom_cache.emplace(
-                debt, GariBottomCacheEntry{physical_errors, physical_cost});
-          } else {
-            bottom_completed = false;
-          }
-          error_chain_arena.resize(arena_checkpoint);
-        }
-      }
-    }
-
-    if (bottom_completed && physical_cost < best_physical_cost) {
-      best_completed_errors = std::move(top_errors);
-      best_completed_errors.insert(best_completed_errors.end(),
-                                   physical_errors.begin(), physical_errors.end());
-      best_physical_cost = physical_cost;
-      completed_candidate_found = true;
-    }
-    const bool improved_shot =
-        bottom_completed &&
-        physical_cost < gari_monolithic_physical_incumbent;
-    if (improved_shot) {
-      gari_monolithic_physical_incumbent = physical_cost;
-    }
-
-    if (is_first_completion) {
-      top_completion_seen = true;
-      if (!continuation_enabled || pqlimit_hit) {
-        return false;
-      }
-      continuation_window = continuation_window_for(top_queue_pops);
-      continuation_deadline = add_saturating(top_queue_pops, continuation_window);
-      return true;
-    }
-
-    if (improved_shot) {
-      continuation_deadline = add_saturating(top_queue_pops, continuation_window);
-      if (collect_stats) {
-        ++gari_monolithic_one_way_stats.continuation_physical_improvements;
-      }
-    }
-    return !pqlimit_hit;
-  };
-
-  boost::dynamic_bitset<> top_state(beam_detector_count);
-  for (size_t d : detections) {
-    top_state[d] = 1;
-  }
-  const double top_initial_cost =
-      initial_phase_cost(top_state, beam_edets, top_error_indices);
-  std::optional<Node> top_solution = run_phase(
-      top_state, top_initial_cost, detector_beam, beam_edets, top_eneighbors,
-      top_error_indices, 0, beam_detector_count, -1, 0, -1, true);
-  if (collect_stats && pqlimit_hit) {
-    ++gari_monolithic_one_way_stats.pqlimit_truncated_trials;
-  }
-  if (!top_solution.has_value() || !completed_candidate_found) {
-    low_confidence_flag = true;
-    if (config.verbose && !pqlimit_hit) {
-      std::cout << (top_solution.has_value()
-                        ? "GARI bottom search failed to converge within beam limit."
-                        : "GARI top search failed to converge within beam limit.")
-                << std::endl;
-    }
-    return;
-  }
-  if (config.verbose) {
-    std::cout << "GARI decoding complete. Physical cost: "
-              << best_physical_cost << " num_pq_pushed = " << num_pq_pushed
-              << std::endl;
-  }
-  if (candidates == nullptr) {
-    predicted_errors_buffer = std::move(best_completed_errors);
-  } else {
-    std::sort(best_completed_errors.begin(), best_completed_errors.end());
-    candidates->push_back(std::move(best_completed_errors));
-  }
-}
-
-void TesseractDecoder::reset_gari_monolithic_one_way_stats() {
-  gari_monolithic_one_way_stats = {};
-  gari_bottom_cache.clear();
-  unique_bottom_debts_explored.clear();
-  gari_monolithic_physical_incumbent = std::numeric_limits<double>::max();
-}
-
 double TesseractDecoder::cost_from_errors(const std::vector<size_t>& predicted_errors) const {
   double total_cost = 0;
   for (size_t dem_error_index : predicted_errors) {
@@ -1357,33 +691,7 @@ double TesseractDecoder::cost_from_errors(const std::vector<size_t>& predicted_e
 
 double TesseractDecoder::solution_cost_from_errors(
     const std::vector<size_t>& predicted_errors) const {
-  if (!config.gari_monolithic_one_way.has_value()) {
-    return cost_from_errors(predicted_errors);
-  }
-
-  double total_cost = 0;
-  const size_t physical_error_count =
-      config.gari_monolithic_one_way->physical_error_count;
-  for (size_t dem_error_index : predicted_errors) {
-    size_t error_index = dem_error_to_error.at(dem_error_index);
-    if (error_index == std::numeric_limits<size_t>::max()) {
-      throw std::invalid_argument("error index does not map to a retained decoder error");
-    }
-    if (dem_error_index < physical_error_count) {
-      if (gari_original_physical_costs_by_error.empty()) {
-        total_cost += errors[error_index].likelihood_cost;
-      } else {
-        const double original_cost =
-            gari_original_physical_costs_by_error.at(error_index);
-        if (!std::isfinite(original_cost)) {
-          throw std::runtime_error(
-              "A retained GARI physical error has no original physical cost.");
-        }
-        total_cost += original_cost;
-      }
-    }
-  }
-  return total_cost;
+  return cost_from_errors(predicted_errors);
 }
 
 std::vector<int> TesseractDecoder::get_flipped_observables(
@@ -1466,10 +774,7 @@ void TesseractDecoder::build_sparse_d2e(const std::vector<uint64_t>& detections)
       }
     }
     if (overlap > 0) {
-      const int degree =
-          gari_monolithic_one_way_enabled
-              ? static_cast<int>(beam_edets[ei].size())
-              : static_cast<int>(errors[ei].symptom.detectors.size());
+      const int degree = static_cast<int>(errors[ei].symptom.detectors.size());
       candidates.push_back({ei, overlap, degree, errors[ei].likelihood_cost});
     }
   }

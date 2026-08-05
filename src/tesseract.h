@@ -19,7 +19,6 @@
 #include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <limits>
-#include <optional>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -36,32 +35,6 @@ constexpr int DEFAULT_DET_BEAM = 5;
 constexpr size_t DEFAULT_PQLIMIT = 200000;
 
 int suggest_sparsify_reactivate_limit(size_t num_detectors, int sparsify_base_degree);
-
-struct GariMonolithicOneWayConfig {
-  size_t real_detector_count = 0;
-  size_t physical_error_count = 0;
-  // Indexed by original flattened DEM physical-error index. Empty preserves
-  // the legacy behavior of taking final costs directly from the GARI DEM.
-  std::vector<double> original_physical_costs;
-  size_t bottom_beam = INF_DET_BEAM;
-  double continuation_factor = 0;
-  bool collect_stats = false;
-};
-
-struct GariMonolithicOneWayStats {
-  size_t top_queue_pops = 0;
-  size_t top_completions_seen = 0;
-  size_t continuation_top_queue_pops = 0;
-  size_t continuation_physical_improvements = 0;
-  size_t pqlimit_truncated_trials = 0;
-  size_t bottom_queue_pops = 0;
-  size_t bottom_contexts_generated = 0;
-  size_t bottom_contexts_explored = 0;
-  size_t bottom_cache_hits = 0;
-  size_t unique_bottom_debts_explored = 0;
-  size_t bottom_children_generated = 0;
-  size_t bottom_nonprogress_children_generated = 0;
-};
 
 struct TesseractConfig {
   stim::DetectorErrorModel dem;
@@ -80,8 +53,6 @@ struct TesseractConfig {
   int sparsify_base_degree = -1;
   int sparsify_max_degree = -1;
   int sparsify_reactivate_limit = -1;
-
-  std::optional<GariMonolithicOneWayConfig> gari_monolithic_one_way;
 
   std::string str();
 };
@@ -138,8 +109,7 @@ struct TesseractDecoder {
   // flattened DEM error indices.
   double cost_from_errors(const std::vector<size_t>& predicted_errors) const;
 
-  // Returns the cost used to choose among completed detector-order/beam searches. This is the full
-  // likelihood cost normally, and the original physical-error cost in GARI monolithic one-way mode.
+  // Returns the likelihood cost used to choose among completed detector-order/beam searches.
   double solution_cost_from_errors(const std::vector<size_t>& predicted_errors) const;
 
   std::vector<int> decode(const std::vector<uint64_t>& detections);
@@ -148,7 +118,6 @@ struct TesseractDecoder {
 
   bool low_confidence_flag = false;
   std::vector<size_t> predicted_errors_buffer;
-  GariMonolithicOneWayStats gari_monolithic_one_way_stats;
   std::vector<size_t> dem_error_to_error;
   std::vector<size_t> error_to_dem_error;
   std::vector<common::Error> errors;
@@ -186,50 +155,16 @@ struct TesseractDecoder {
                                        int64_t stop_before_error_chain_idx = -1) const;
 
  private:
-  struct DynamicBitsetHash {
-    size_t operator()(const boost::dynamic_bitset<>& bits) const {
-      return boost::hash_value(bits);
-    }
-  };
-
-  struct GariBottomCacheEntry {
-    std::vector<size_t> physical_errors;
-    double physical_cost = 0;
-  };
-
   std::vector<uint64_t> sparse_d2e_detections;
-  std::vector<uint8_t> error_is_physical;
-  std::vector<std::vector<int>> beam_edets;
-  std::vector<std::vector<int>> top_eneighbors;
-  std::vector<size_t> top_error_indices;
-  std::vector<size_t> bottom_error_indices;
-  std::vector<DetectorCostTuple> gari_initial_cost_tuples;
-  std::vector<DetectorCostTuple> gari_detector_cost_tuples;
-  std::vector<DetectorCostTuple> gari_next_detector_cost_tuples;
-  std::vector<double> gari_detector_cost_cache;
-  // Indexed by retained decoder error after optional error merging.
-  std::vector<double> gari_original_physical_costs_by_error;
-  size_t beam_detector_count = 0;
-  bool gari_monolithic_one_way_enabled = false;
-  std::unordered_map<boost::dynamic_bitset<>, GariBottomCacheEntry, DynamicBitsetHash>
-      gari_bottom_cache;
-  std::unordered_set<boost::dynamic_bitset<>, DynamicBitsetHash>
-      unique_bottom_debts_explored;
-  double gari_monolithic_physical_incumbent = std::numeric_limits<double>::max();
   int sparse_d2e_reactivate_limit = -1;
   bool sparse_d2e_valid = false;
 
-  void reset_gari_monolithic_one_way_stats();
   void build_sparse_d2e(const std::vector<uint64_t>& detections);
   void decode_to_errors_with_graph(const std::vector<uint64_t>& detections, size_t detector_order,
                                    size_t detector_beam,
                                    const std::vector<std::vector<int>>& active_d2e,
                                    size_t max_candidates = 1,
                                    std::vector<std::vector<size_t>>* candidates = nullptr);
-  void decode_gari_monolithic_one_way_with_graph(const std::vector<uint64_t>& detections,
-                                                 size_t detector_order, size_t detector_beam,
-                                                 const std::vector<std::vector<int>>& active_d2e,
-                                                 std::vector<std::vector<size_t>>* candidates);
 };
 
 #endif  // TESSERACT_DECODER_H
