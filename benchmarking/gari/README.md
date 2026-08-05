@@ -41,7 +41,7 @@ A fixed beam with one top order performs one top-and-bottom pass:
   --stats-out "<fixed-stats>.json"
 ```
 
-For a single constrained search over the full GARI model, use the mapped
+For projected first-completion decoding over the full GARI model, use the mapped
 `_ogL_modeN.dem` with `--gari-monolithic-one-way` instead of
 `--gari-two-stage`:
 
@@ -51,41 +51,30 @@ For a single constrained search over the full GARI model, use the mapped
   --dem "<gari>/<stem>_ogL_modeN.dem" \
   --det-mapping-file "<gari>/<stem>_two_stage_mapping.json" \
   --sample-num-shots 10 --sample-seed 0 --threads 1 \
-  --beam 5 --num-det-orders 16 --det-order-bfs \
-  --gari-monolithic-debt-states 2 \
+  --beam 20 --num-det-orders 16 --det-order-bfs \
   --gari-monolithic-bottom-beam 2 \
   --pqlimit 1000000 --stats-out "<one-way-stats>.json"
 ```
 
-This mode uses the normal monolithic Tesseract decoder, with one priority
-queue, error chain, and beam per detector-order trial. Each order contains a
-varied real-detector prefix followed by the same natural virtual-detector
-suffix. Barred columns remain selectable from real pivots and create their
-virtual identity debt, but virtual pivots expose physical columns only. The
-beam counts active real detectors, so accumulated debt does not by itself
-prune a top branch; debt repayment still contributes to queue priority.
-Used alone, `--gari-monolithic-debt-states D` keeps the normal debt-aware queue
-score, but admits at most `D` debt states (selected or pending) for each
-identical nonempty real residual. Worse pending debts are rejected or replaced
-before expansion.
-Replaced queue records are skipped when popped, but still count toward
-`--pqlimit`. The debt sets reset for every beam/order trial; distinct debts
-reaching an empty real residual remain uncapped. `--no-revisit-dets`
-additionally keeps only the best pending path for each admitted real/debt state.
-`--gari-monolithic-phase-mask` is an independent experiment that hides debt
-from the queue score until the real residual clears. It can be combined with D,
-but is not implied by it. Omitting both options preserves the original
-full-GARI bookkeeping. `--gari-monolithic-bottom-beam 2` gives each entered
-debt its own fixed virtual-detector beam; omitting it preserves the unbounded
-bottom behavior.
+For each detector-order trial, this mode first runs an independent-style
+Tesseract search on the projected real block. Its state, priority, beam, and
+visited key contain only the real residual. The first zero-real state popped
+from that queue is frozen; all other top states are discarded. Its virtual
+debt is then materialized once and passed to one fresh physical-only bottom
+search in natural detector order. `--gari-monolithic-bottom-beam 2` bounds that
+bottom search; omitting it leaves the bottom beam unbounded. The queue-push
+limit is shared by the two sequential searches.
+
+`--no-revisit-dets` uses the ordinary exact-state rule in both phases: the
+projected real bitset is the top key and the virtual residual bitset is the
+bottom key. Omitting the flag disables both visited-state filters.
 Completed trials are compared using original physical-error cost only, and
 the `_ogL` layout makes observables physical-only. The standard
 `--beam-climbing`, `--no-revisit-dets`, ordering, sparsification, and queue-limit
 options remain available. One-way sparsification retains every physical column
 and sparsifies only eligible barred columns. The `gari_monolithic_one_way`
 statistics block records the layout sizes, queue work by phase, entered bottom
-debts, same-weight bottom branching, ordering policies, and the beam/cost
-scopes.
+debt, same-weight bottom branching, ordering policies, and the beam/cost scopes.
 
 For two-stage decoding, add `--beam-climbing` to test beams 0 through 20. Set
 `--num-det-orders 21` to cycle through 21 randomized top index orders during

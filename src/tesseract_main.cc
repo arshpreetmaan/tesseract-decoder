@@ -233,8 +233,6 @@ struct Args {
   bool gari_two_stage = false;
   bool gari_monolithic_one_way = false;
   size_t gari_monolithic_bottom_beam = INF_DET_BEAM;
-  bool gari_monolithic_phase_mask = false;
-  size_t gari_monolithic_debt_states = std::numeric_limits<size_t>::max();
   bool gari_split_top = false;
   std::string gari_bottom_decoder = "tesseract";
   size_t gari_bottom_beam = 2;
@@ -443,12 +441,6 @@ struct Args {
         throw std::invalid_argument(
             "--gari-monolithic-bottom-beam must be below the infinity sentinel");
       }
-      if (program.is_used("--gari-monolithic-debt-states")) {
-        if (gari_monolithic_debt_states == 0) {
-          throw std::invalid_argument(
-              "--gari-monolithic-debt-states must be at least 1");
-        }
-      }
       if (program.is_used("--gari-bottom-decoder") ||
           program.is_used("--gari-bottom-beam") ||
           program.is_used("--gari-bottom-num-det-orders") ||
@@ -457,9 +449,7 @@ struct Args {
             "GARI two-stage bottom and candidate options cannot be used with "
             "--gari-monolithic-one-way");
       }
-    } else if (program.is_used("--gari-monolithic-bottom-beam") ||
-               program.is_used("--gari-monolithic-phase-mask") ||
-               program.is_used("--gari-monolithic-debt-states")) {
+    } else if (program.is_used("--gari-monolithic-bottom-beam")) {
       throw std::invalid_argument(
           "GARI monolithic options require --gari-monolithic-one-way");
     }
@@ -599,8 +589,6 @@ struct Args {
           .real_detector_count = gari_two_stage_layout.physical_detector_count,
           .physical_error_count = gari_two_stage_layout.physical_error_count,
           .bottom_beam = gari_monolithic_bottom_beam,
-          .phase_mask_top = gari_monolithic_phase_mask,
-          .max_debt_states = gari_monolithic_debt_states,
       };
     }
 
@@ -801,30 +789,17 @@ int main(int argc, char* argv[]) {
       .store_into(args.gari_two_stage);
   program.add_argument("--gari-monolithic-one-way")
       .help(
-          "Use one monolithic GARI search with real detectors first and prohibit "
-          "barred errors at virtual pivots")
+          "Decode the projected real GARI block to its first completion, freeze its debt, "
+          "then decode the virtual block with physical errors")
       .flag()
       .store_into(args.gari_monolithic_one_way);
   program.add_argument("--gari-monolithic-bottom-beam")
       .help(
-          "Per-entry-debt virtual-detector beam for monolithic one-way GARI decoding "
+          "Virtual-detector beam for the frozen-debt GARI bottom search "
           "(disabled by default)")
       .metavar("N")
       .default_value(INF_DET_BEAM)
       .store_into(args.gari_monolithic_bottom_beam);
-  program.add_argument("--gari-monolithic-phase-mask")
-      .help(
-          "Use the compact real/barred graph while the monolithic GARI search is in its top "
-          "phase; tracked debt enters the queue heuristic only when the real residual clears")
-      .flag()
-      .store_into(args.gari_monolithic_phase_mask);
-  program.add_argument("--gari-monolithic-debt-states")
-      .help(
-          "Maximum admitted debt states for each nonempty real residual; independent of "
-          "--gari-monolithic-phase-mask")
-      .metavar("D")
-      .default_value(std::numeric_limits<size_t>::max())
-      .store_into(args.gari_monolithic_debt_states);
   program.add_argument("--gari-split-top")
       .help("Decode the independent GARI D_X and D_Z top blocks separately")
       .flag()
@@ -1332,8 +1307,6 @@ int main(int argc, char* argv[]) {
         totals.bottom_children_generated += one_way_stats[i].bottom_children_generated;
         totals.bottom_nonprogress_children_generated +=
             one_way_stats[i].bottom_nonprogress_children_generated;
-        totals.top_debt_state_limit_prunes +=
-            one_way_stats[i].top_debt_state_limit_prunes;
       }
       stats_json["gari_monolithic_one_way"] = {
           {"real_detector_count", args.gari_two_stage_layout.physical_detector_count},
@@ -1342,22 +1315,17 @@ int main(int argc, char* argv[]) {
           {"barred_error_count", args.gari_two_stage_layout.barred_error_count},
           {"real_detector_order_method", args.detector_order_method_name()},
           {"virtual_detector_order", "natural"},
-          {"phase_mask_top", args.gari_monolithic_phase_mask},
-          {"max_debt_states_per_nonempty_real_residual",
-           args.gari_monolithic_debt_states != std::numeric_limits<size_t>::max()
-               ? nlohmann::json(args.gari_monolithic_debt_states)
-               : nlohmann::json(nullptr)},
+          {"top_completion_policy", "first_projected_completion"},
           {"bottom_beam",
            args.gari_monolithic_bottom_beam < INF_DET_BEAM
                ? nlohmann::json(args.gari_monolithic_bottom_beam)
                : nlohmann::json(nullptr)},
           {"beam_scope",
            args.gari_monolithic_bottom_beam < INF_DET_BEAM
-               ? "real_top_and_per_entry_virtual_bottom"
-               : "real_detectors"},
+               ? "projected_real_top_and_frozen_virtual_bottom"
+               : "projected_real_top"},
           {"final_cost_scope", "physical_errors"},
           {"top_queue_pops", totals.top_queue_pops},
-          {"top_debt_state_limit_prunes", totals.top_debt_state_limit_prunes},
           {"bottom_queue_pops", totals.bottom_queue_pops},
           {"bottom_contexts_generated", totals.bottom_contexts_generated},
           {"bottom_contexts_explored", totals.bottom_contexts_explored},

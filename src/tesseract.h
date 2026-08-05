@@ -40,8 +40,6 @@ struct GariMonolithicOneWayConfig {
   size_t real_detector_count = 0;
   size_t physical_error_count = 0;
   size_t bottom_beam = INF_DET_BEAM;
-  bool phase_mask_top = false;
-  size_t max_debt_states = std::numeric_limits<size_t>::max();
   bool collect_stats = false;
 };
 
@@ -53,7 +51,6 @@ struct GariMonolithicOneWayStats {
   size_t unique_bottom_debts_explored = 0;
   size_t bottom_children_generated = 0;
   size_t bottom_nonprogress_children_generated = 0;
-  size_t top_debt_state_limit_prunes = 0;
 };
 
 struct TesseractConfig {
@@ -84,9 +81,6 @@ class Node {
   double cost;
   // The number of activated detectors (dets for short) at this node
   size_t num_dets;
-  // The number of activated detectors used by the beam cutoff. This is equal
-  // to num_dets normally, but excludes virtual GARI detectors in one-way mode.
-  size_t beam_dets;
   size_t depth;
   int64_t error_chain_idx = -1;
 
@@ -177,7 +171,9 @@ struct TesseractDecoder {
   void flip_detectors_and_block_errors(size_t detector_order, int64_t error_chain_idx,
                                        boost::dynamic_bitset<>& detectors,
                                        std::vector<DetectorCostTuple>& detector_cost_tuples,
-                                       const std::vector<std::vector<int>>& active_d2e) const;
+                                       const std::vector<std::vector<int>>& active_d2e,
+                                       const std::vector<std::vector<int>>& state_edets,
+                                       int64_t stop_before_error_chain_idx = -1) const;
 
  private:
   std::vector<uint64_t> sparse_d2e_detections;
@@ -186,9 +182,12 @@ struct TesseractDecoder {
   std::vector<std::vector<int>> top_eneighbors;
   std::vector<size_t> top_error_indices;
   std::vector<size_t> bottom_error_indices;
+  std::vector<DetectorCostTuple> gari_initial_cost_tuples;
+  std::vector<DetectorCostTuple> gari_detector_cost_tuples;
+  std::vector<DetectorCostTuple> gari_next_detector_cost_tuples;
+  std::vector<double> gari_detector_cost_cache;
   size_t beam_detector_count = 0;
   bool gari_monolithic_one_way_enabled = false;
-  bool gari_phase_mask_top_enabled = false;
   std::unordered_set<size_t> unique_bottom_debt_hashes;
   int sparse_d2e_reactivate_limit = -1;
   bool sparse_d2e_valid = false;
@@ -200,6 +199,10 @@ struct TesseractDecoder {
                                    const std::vector<std::vector<int>>& active_d2e,
                                    size_t max_candidates = 1,
                                    std::vector<std::vector<size_t>>* candidates = nullptr);
+  void decode_gari_monolithic_one_way_with_graph(const std::vector<uint64_t>& detections,
+                                                 size_t detector_order, size_t detector_beam,
+                                                 const std::vector<std::vector<int>>& active_d2e,
+                                                 std::vector<std::vector<size_t>>* candidates);
 };
 
 #endif  // TESSERACT_DECODER_H
