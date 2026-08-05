@@ -448,7 +448,6 @@ struct Args {
           throw std::invalid_argument(
               "--gari-monolithic-debt-states must be at least 1");
         }
-        gari_monolithic_phase_mask = true;
       }
       if (program.is_used("--gari-bottom-decoder") ||
           program.is_used("--gari-bottom-beam") ||
@@ -821,7 +820,7 @@ int main(int argc, char* argv[]) {
       .store_into(args.gari_monolithic_phase_mask);
   program.add_argument("--gari-monolithic-debt-states")
       .help(
-          "Maximum distinct debt states retained for each nonempty real residual; implies "
+          "Maximum admitted debt states for each nonempty real residual; independent of "
           "--gari-monolithic-phase-mask")
       .metavar("D")
       .default_value(std::numeric_limits<size_t>::max())

@@ -209,11 +209,6 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
     if (one_way.max_debt_states == 0) {
       throw std::invalid_argument("GARI max_debt_states must be at least 1.");
     }
-    if (!one_way.phase_mask_top &&
-        one_way.max_debt_states != std::numeric_limits<size_t>::max()) {
-      throw std::invalid_argument(
-          "Finite GARI debt states require the phase-masked top search.");
-    }
     gari_phase_mask_top_enabled = one_way.phase_mask_top;
     beam_detector_count = one_way.real_detector_count;
 
@@ -348,17 +343,28 @@ void TesseractDecoder::initialize_structures(size_t num_detectors) {
                            errors[i].likelihood_cost / errors[i].symptom.detectors.size()});
   }
 
+  const bool deterministic_debt_order =
+      config.gari_monolithic_one_way.has_value() &&
+      config.gari_monolithic_one_way->max_debt_states !=
+          std::numeric_limits<size_t>::max();
   for (size_t d = 0; d < num_detectors; ++d) {
-    std::sort(d2e[d].begin(), d2e[d].end(), [this, d](size_t idx_a, size_t idx_b) {
-      if (gari_phase_mask_top_enabled && d < beam_detector_count) {
-        const double cost_a =
-            errors[idx_a].likelihood_cost / beam_edets[idx_a].size();
-        const double cost_b =
-            errors[idx_b].likelihood_cost / beam_edets[idx_b].size();
-        return cost_a < cost_b;
-      }
-      return error_costs[idx_a].min_cost < error_costs[idx_b].min_cost;
-    });
+    std::sort(d2e[d].begin(), d2e[d].end(),
+              [this, d, deterministic_debt_order](size_t idx_a, size_t idx_b) {
+                const bool break_debt_ties =
+                    deterministic_debt_order && d < beam_detector_count;
+                if (gari_phase_mask_top_enabled && d < beam_detector_count) {
+                  const double cost_a =
+                      errors[idx_a].likelihood_cost / beam_edets[idx_a].size();
+                  const double cost_b =
+                      errors[idx_b].likelihood_cost / beam_edets[idx_b].size();
+                  return cost_a != cost_b ? cost_a < cost_b
+                                          : break_debt_ties && idx_a < idx_b;
+                }
+                const double cost_a = error_costs[idx_a].min_cost;
+                const double cost_b = error_costs[idx_b].min_cost;
+                return cost_a != cost_b ? cost_a < cost_b
+                                        : break_debt_ties && idx_a < idx_b;
+              });
   }
 
   if (gari_phase_mask_top_enabled) {
@@ -583,7 +589,11 @@ void TesseractDecoder::decode_to_errors_with_graph(
                                      ? config.gari_monolithic_one_way->max_debt_states
                                      : std::numeric_limits<size_t>::max();
   const bool debt_state_limit_enabled =
-      phase_mask_top && max_debt_states != std::numeric_limits<size_t>::max();
+      gari_monolithic_one_way_enabled &&
+      max_debt_states != std::numeric_limits<size_t>::max();
+  const bool debt_tracking_enabled = phase_mask_top || debt_state_limit_enabled;
+  const bool collect_one_way_stats =
+      gari_monolithic_one_way_enabled && config.gari_monolithic_one_way->collect_stats;
   struct BottomBeamContext {
     size_t min_virtual_dets;
   };
@@ -596,12 +606,38 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
   std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
   std::unordered_map<size_t, std::unordered_set<boost::dynamic_bitset<>>> visited_detectors;
-  using DebtBucket = std::vector<boost::dynamic_bitset<>>;
+  constexpr uint64_t NO_DEBT_TICKET = std::numeric_limits<uint64_t>::max();
+  struct DebtTicket {
+    bool live;
+    bool selected;
+  };
+  struct DebtSlot {
+    boost::dynamic_bitset<> debt;
+    double cost;
+    size_t num_dets;
+    size_t depth;
+    uint64_t ticket;
+  };
+  using DebtBucket = std::vector<DebtSlot>;
   using DebtFrontier =
       std::unordered_map<boost::dynamic_bitset<>, DebtBucket>;
-  std::vector<DebtFrontier> top_debt_frontiers(
-      debt_state_limit_enabled ? beam_detector_count + 1 : 0);
+  size_t top_debt_frontier_levels = 0;
+  if (debt_state_limit_enabled && !detections.empty()) {
+    size_t highest_reachable = std::min(beam_detector_count, detections.size());
+    highest_reachable +=
+        std::min(detector_beam, beam_detector_count - highest_reachable);
+    top_debt_frontier_levels = highest_reachable + 1;
+  }
+  std::vector<DebtFrontier> top_debt_frontiers(top_debt_frontier_levels);
   std::unordered_set<boost::dynamic_bitset<>> bottom_entry_debts;
+  std::vector<DebtTicket> debt_tickets;
+  std::vector<uint64_t> error_chain_debt_ticket;
+  if (debt_state_limit_enabled && !detections.empty() &&
+      config.pqlimit != std::numeric_limits<size_t>::max()) {
+    const size_t reserve = std::min(config.pqlimit, size_t{4096});
+    debt_tickets.reserve(reserve);
+    error_chain_debt_ticket.reserve(reserve);
+  }
 
   boost::dynamic_bitset<> initial_detectors(num_detectors, false);
   std::vector<DetectorCostTuple> initial_detector_cost_tuples(num_errors);
@@ -641,14 +677,15 @@ void TesseractDecoder::decode_to_errors_with_graph(
   boost::dynamic_bitset<> next_detectors;
   boost::dynamic_bitset<> detectors = initial_detectors;
   std::vector<DetectorCostTuple> detector_cost_tuples(num_errors);
-  std::vector<DetectorCostTuple> next_detector_cost_tuples(num_errors);
-  std::vector<DetectorCostTuple> bottom_entry_cost_tuples(
-      phase_mask_top ? num_errors : 0);
-  std::vector<double> detector_cost_cache(num_detectors);
+  std::vector<DetectorCostTuple> next_detector_cost_tuples;
+  std::vector<DetectorCostTuple> bottom_entry_cost_tuples;
+  std::vector<double> detector_cost_cache;
   boost::dynamic_bitset<> real_state_scratch(
-      debt_state_limit_enabled ? beam_detector_count : 0);
+      debt_state_limit_enabled && !detections.empty() ? beam_detector_count : 0);
   boost::dynamic_bitset<> debt_state_scratch(
-      phase_mask_top ? num_detectors - beam_detector_count : 0);
+      debt_tracking_enabled && !detections.empty()
+          ? num_detectors - beam_detector_count
+          : 0);
 
   auto load_real_state = [&](const boost::dynamic_bitset<>& detectors) {
     real_state_scratch.reset();
@@ -669,6 +706,9 @@ void TesseractDecoder::decode_to_errors_with_graph(
     }
   };
   auto bottom_entry_heuristic = [&](const boost::dynamic_bitset<>& detectors) {
+    if (bottom_entry_cost_tuples.empty()) {
+      bottom_entry_cost_tuples.resize(num_errors);
+    }
     for (size_t ei : bottom_error_indices) {
       bottom_entry_cost_tuples[ei] = {};
     }
@@ -688,10 +728,102 @@ void TesseractDecoder::decode_to_errors_with_graph(
     return result;
   };
 
+  auto debt_less = [](const boost::dynamic_bitset<>& a,
+                      const boost::dynamic_bitset<>& b) {
+    for (size_t i = a.size(); i-- > 0;) {
+      if (a[i] != b[i]) return !a[i];
+    }
+    return false;
+  };
+  auto rank_better = [&](double cost, size_t num_dets, size_t depth,
+                         const boost::dynamic_bitset<>& debt, const DebtSlot& slot) {
+    if (cost != slot.cost) return cost < slot.cost;
+    if (num_dets != slot.num_dets) return num_dets > slot.num_dets;
+    if (depth != slot.depth) return depth < slot.depth;
+    return debt_less(debt, slot.debt);
+  };
+  auto new_debt_ticket = [&]() {
+    debt_tickets.push_back({true, false});
+    return static_cast<uint64_t>(debt_tickets.size() - 1);
+  };
+  auto admit_top_debt = [&](const boost::dynamic_bitset<>& state, double cost,
+                            size_t num_dets, size_t depth,
+                            size_t real_dets) -> uint64_t {
+    load_real_state(state);
+    load_debt_state(state);
+    auto& frontier = top_debt_frontiers[real_dets];
+    auto [frontier_it, inserted] = frontier.try_emplace(real_state_scratch);
+    auto& debts = frontier_it->second;
+    if (inserted) {
+      debts.reserve(std::min(max_debt_states, size_t{4}));
+    }
+
+    auto same_debt = std::find_if(
+        debts.begin(), debts.end(), [&](const DebtSlot& slot) {
+          return slot.debt == debt_state_scratch;
+        });
+    if (same_debt != debts.end()) {
+      auto& ticket = debt_tickets[same_debt->ticket];
+      if (!config.no_revisit_dets) {
+        if (rank_better(cost, num_dets, depth, debt_state_scratch, *same_debt)) {
+          same_debt->cost = cost;
+          same_debt->num_dets = num_dets;
+          same_debt->depth = depth;
+        }
+        return same_debt->ticket;
+      }
+      if (ticket.selected ||
+          !rank_better(cost, num_dets, depth, debt_state_scratch, *same_debt)) {
+        if (collect_one_way_stats) {
+          ++gari_monolithic_one_way_stats.top_debt_state_limit_prunes;
+        }
+        return NO_DEBT_TICKET;
+      }
+      ticket.live = false;
+      same_debt->cost = cost;
+      same_debt->num_dets = num_dets;
+      same_debt->depth = depth;
+      same_debt->ticket = new_debt_ticket();
+      return same_debt->ticket;
+    }
+
+    if (debts.size() < max_debt_states) {
+      uint64_t ticket = new_debt_ticket();
+      debts.push_back({debt_state_scratch, cost, num_dets, depth, ticket});
+      return ticket;
+    }
+
+    auto worst_pending = debts.end();
+    for (auto it = debts.begin(); it != debts.end(); ++it) {
+      if (debt_tickets[it->ticket].selected) continue;
+      if (worst_pending == debts.end() ||
+          rank_better(worst_pending->cost, worst_pending->num_dets,
+                      worst_pending->depth, worst_pending->debt, *it)) {
+        worst_pending = it;
+      }
+    }
+    if (worst_pending == debts.end() ||
+        !rank_better(cost, num_dets, depth, debt_state_scratch, *worst_pending)) {
+      if (collect_one_way_stats) {
+        ++gari_monolithic_one_way_stats.top_debt_state_limit_prunes;
+      }
+      return NO_DEBT_TICKET;
+    }
+
+    debt_tickets[worst_pending->ticket].live = false;
+    uint64_t ticket = new_debt_ticket();
+    *worst_pending = {debt_state_scratch, cost, num_dets, depth, ticket};
+    return ticket;
+  };
+
+  uint64_t initial_debt_ticket = NO_DEBT_TICKET;
+  if (debt_state_limit_enabled && min_beam_dets > 0) {
+    initial_debt_ticket = admit_top_debt(
+        initial_detectors, initial_cost, detections.size(), 0, min_beam_dets);
+    assert(initial_debt_ticket != NO_DEBT_TICKET);
+  }
   pq.push({initial_cost, detections.size(), min_beam_dets, 0, -1});
   size_t num_pq_pushed = 1;
-  const bool collect_one_way_stats =
-      gari_monolithic_one_way_enabled && config.gari_monolithic_one_way->collect_stats;
 
   while (!pq.empty()) {
     const Node node = pq.top();
@@ -718,6 +850,19 @@ void TesseractDecoder::decode_to_errors_with_graph(
     }
 
     if (node.beam_dets > max_beam_dets) continue;
+    if (debt_state_limit_enabled && node.beam_dets > 0) {
+      uint64_t ticket = node.error_chain_idx == -1
+                            ? initial_debt_ticket
+                            : error_chain_debt_ticket[node.error_chain_idx];
+      if (ticket == NO_DEBT_TICKET || !debt_tickets[ticket].live ||
+          (config.no_revisit_dets && debt_tickets[ticket].selected)) {
+        if (collect_one_way_stats) {
+          ++gari_monolithic_one_way_stats.top_debt_state_limit_prunes;
+        }
+        continue;
+      }
+      debt_tickets[ticket].selected = true;
+    }
 
     uint32_t bottom_context = NO_BOTTOM_CONTEXT;
     if (bottom_beam_enabled && node.beam_dets == 0 && node.error_chain_idx != -1) {
@@ -751,7 +896,7 @@ void TesseractDecoder::decode_to_errors_with_graph(
     flip_detectors_and_block_errors(detector_order, node.error_chain_idx, detectors,
                                     detector_cost_tuples, active_d2e);
 
-    if (phase_mask_top && is_bottom_entry) {
+    if (debt_tracking_enabled && !config.no_revisit_dets && is_bottom_entry) {
       load_debt_state(detectors);
       if (!bottom_entry_debts.insert(debt_state_scratch).second) {
         continue;
@@ -813,31 +958,9 @@ void TesseractDecoder::decode_to_errors_with_graph(
       continue;
     }
 
-    if (debt_state_limit_enabled && node.beam_dets > 0) {
-      auto& frontier = top_debt_frontiers[node.beam_dets];
-      load_real_state(detectors);
-      auto frontier_it = frontier.find(real_state_scratch);
-      load_debt_state(detectors);
-      if (frontier_it == frontier.end()) {
-        DebtBucket debts;
-        debts.reserve(std::min(max_debt_states, size_t{4}));
-        debts.push_back(debt_state_scratch);
-        frontier.emplace(real_state_scratch, std::move(debts));
-      } else {
-        auto& debts = frontier_it->second;
-        if (std::find(debts.begin(), debts.end(), debt_state_scratch) != debts.end()) {
-          continue;
-        }
-        if (debts.size() >= max_debt_states) {
-          if (collect_one_way_stats) {
-            ++gari_monolithic_one_way_stats.top_debt_state_limit_prunes;
-          }
-          continue;
-        }
-        debts.push_back(debt_state_scratch);
-      }
-    } else if (config.no_revisit_dets &&
-               !visited_detectors[node.beam_dets].insert(detectors).second) {
+    if (config.no_revisit_dets &&
+        !(debt_state_limit_enabled && node.beam_dets > 0) &&
+        !visited_detectors[node.beam_dets].insert(detectors).second) {
       continue;
     }
 
@@ -892,6 +1015,11 @@ void TesseractDecoder::decode_to_errors_with_graph(
         const size_t first_cleared = min_beam_dets + detector_beam + 1;
         const size_t last_cleared = std::min(max_beam_dets, beam_detector_count);
         for (size_t i = first_cleared; i <= last_cleared; ++i) {
+          for (auto& [real_state, debts] : top_debt_frontiers[i]) {
+            for (const auto& debt : debts) {
+              debt_tickets[debt.ticket].live = false;
+            }
+          }
           top_debt_frontiers[i].clear();
         }
       }
@@ -909,6 +1037,9 @@ void TesseractDecoder::decode_to_errors_with_graph(
       }
     }
 
+    if (next_detector_cost_tuples.empty()) {
+      next_detector_cost_tuples.resize(num_errors);
+    }
     if (phase_error_indices == nullptr) {
       next_detector_cost_tuples = detector_cost_tuples;
     } else {
@@ -927,6 +1058,9 @@ void TesseractDecoder::decode_to_errors_with_graph(
     }
 
     size_t prev_ei = std::numeric_limits<size_t>::max();
+    if (detector_cost_cache.empty()) {
+      detector_cost_cache.resize(num_detectors);
+    }
     if (!phase_mask_top) {
       std::fill(detector_cost_cache.begin(), detector_cost_cache.end(), -1);
     } else if (top_phase) {
@@ -996,18 +1130,6 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
       if (next_beam_dets > max_beam_dets) continue;
 
-      if (debt_state_limit_enabled && next_beam_dets > 0) {
-        load_real_state(next_detectors);
-        auto frontier = top_debt_frontiers[next_beam_dets].find(real_state_scratch);
-        if (frontier != top_debt_frontiers[next_beam_dets].end() &&
-            frontier->second.size() >= max_debt_states) {
-          if (collect_one_way_stats) {
-            ++gari_monolithic_one_way_stats.top_debt_state_limit_prunes;
-          }
-          continue;
-        }
-      }
-
       if (config.no_revisit_dets &&
           !(debt_state_limit_enabled && next_beam_dets > 0) &&
           visited_detectors[next_beam_dets].find(next_detectors) !=
@@ -1052,6 +1174,14 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
       if (next_cost == INF) continue;
 
+      uint64_t next_debt_ticket = NO_DEBT_TICKET;
+      if (debt_state_limit_enabled && next_beam_dets > 0) {
+        next_debt_ticket = admit_top_debt(
+            next_detectors, next_cost, next_num_dets, node.depth + 1,
+            next_beam_dets);
+        if (next_debt_ticket == NO_DEBT_TICKET) continue;
+      }
+
       uint32_t next_bottom_context = bottom_context;
       if (bottom_beam_enabled) {
         if (bottom_context != NO_BOTTOM_CONTEXT) {
@@ -1081,6 +1211,9 @@ void TesseractDecoder::decode_to_errors_with_graph(
       next_node.parent_idx = node.error_chain_idx;
       if (bottom_beam_enabled) {
         error_chain_bottom_context.push_back(next_bottom_context);
+      }
+      if (debt_state_limit_enabled) {
+        error_chain_debt_ticket.push_back(next_debt_ticket);
       }
 
       pq.push({next_cost, next_num_dets, next_beam_dets, node.depth + 1,
