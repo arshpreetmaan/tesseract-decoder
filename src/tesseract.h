@@ -17,6 +17,7 @@
 
 #include <boost/dynamic_bitset.hpp>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <queue>
 #include <string>
@@ -39,6 +40,8 @@ struct GariMonolithicOneWayConfig {
   size_t real_detector_count = 0;
   size_t physical_error_count = 0;
   size_t bottom_beam = INF_DET_BEAM;
+  bool phase_mask_top = false;
+  size_t max_debt_states = std::numeric_limits<size_t>::max();
   bool collect_stats = false;
 };
 
@@ -50,6 +53,7 @@ struct GariMonolithicOneWayStats {
   size_t unique_bottom_debts_explored = 0;
   size_t bottom_children_generated = 0;
   size_t bottom_nonprogress_children_generated = 0;
+  size_t top_debt_state_limit_prunes = 0;
 };
 
 struct TesseractConfig {
@@ -167,6 +171,9 @@ struct TesseractDecoder {
   double get_detcost(size_t d, const std::vector<DetectorCostTuple>& detector_cost_tuples) const;
   double get_detcost(size_t d, const std::vector<DetectorCostTuple>& detector_cost_tuples,
                      const std::vector<std::vector<int>>& active_d2e) const;
+  double get_detcost(size_t d, const std::vector<DetectorCostTuple>& detector_cost_tuples,
+                     const std::vector<std::vector<int>>& active_d2e,
+                     const std::vector<std::vector<int>>& cost_edets) const;
   void flip_detectors_and_block_errors(size_t detector_order, int64_t error_chain_idx,
                                        boost::dynamic_bitset<>& detectors,
                                        std::vector<DetectorCostTuple>& detector_cost_tuples,
@@ -176,8 +183,12 @@ struct TesseractDecoder {
   std::vector<uint64_t> sparse_d2e_detections;
   std::vector<uint8_t> error_is_physical;
   std::vector<std::vector<int>> beam_edets;
+  std::vector<std::vector<int>> top_eneighbors;
+  std::vector<size_t> top_error_indices;
+  std::vector<size_t> bottom_error_indices;
   size_t beam_detector_count = 0;
   bool gari_monolithic_one_way_enabled = false;
+  bool gari_phase_mask_top_enabled = false;
   std::unordered_set<size_t> unique_bottom_debt_hashes;
   int sparse_d2e_reactivate_limit = -1;
   bool sparse_d2e_valid = false;

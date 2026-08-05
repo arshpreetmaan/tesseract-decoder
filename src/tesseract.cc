@@ -97,6 +97,14 @@ std::string TesseractConfig::str() {
   ss << "create_visualization=" << config.create_visualization;
   if (config.gari_monolithic_one_way.has_value()) {
     ss << ", gari_monolithic_one_way=true";
+    if (config.gari_monolithic_one_way->phase_mask_top) {
+      ss << ", gari_monolithic_phase_mask=true";
+    }
+    if (config.gari_monolithic_one_way->max_debt_states !=
+        std::numeric_limits<size_t>::max()) {
+      ss << ", gari_monolithic_debt_states="
+         << config.gari_monolithic_one_way->max_debt_states;
+    }
     if (config.gari_monolithic_one_way->bottom_beam < INF_DET_BEAM) {
       ss << ", gari_monolithic_bottom_beam="
          << config.gari_monolithic_one_way->bottom_beam;
@@ -135,6 +143,13 @@ double TesseractDecoder::get_detcost(
 double TesseractDecoder::get_detcost(size_t d,
                                      const std::vector<DetectorCostTuple>& detector_cost_tuples,
                                      const std::vector<std::vector<int>>& active_d2e) const {
+  return get_detcost(d, detector_cost_tuples, active_d2e, edets);
+}
+
+double TesseractDecoder::get_detcost(
+    size_t d, const std::vector<DetectorCostTuple>& detector_cost_tuples,
+    const std::vector<std::vector<int>>& active_d2e,
+    const std::vector<std::vector<int>>& cost_edets) const {
   double min_cost = INF;
   uint32_t min_det_cost_det_count = std::numeric_limits<uint32_t>::max();
   double error_cost;
@@ -143,8 +158,10 @@ double TesseractDecoder::get_detcost(size_t d,
 
   for (int ei : active_d2e[d]) {
     ec = error_costs[ei];
+    const size_t degree = cost_edets[ei].size();
+    if (degree == 0) continue;
     if (ec.likelihood_cost * min_det_cost_det_count >=
-        min_cost * errors[ei].symptom.detectors.size())
+        min_cost * degree)
       break;
 
     dct = detector_cost_tuples[ei];
@@ -189,6 +206,15 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
       throw std::invalid_argument(
           "GARI physical_error_count cannot exceed the original DEM error count.");
     }
+    if (one_way.max_debt_states == 0) {
+      throw std::invalid_argument("GARI max_debt_states must be at least 1.");
+    }
+    if (!one_way.phase_mask_top &&
+        one_way.max_debt_states != std::numeric_limits<size_t>::max()) {
+      throw std::invalid_argument(
+          "Finite GARI debt states require the phase-masked top search.");
+    }
+    gari_phase_mask_top_enabled = one_way.phase_mask_top;
     beam_detector_count = one_way.real_detector_count;
 
     error_is_physical.resize(config.dem.count_errors());
@@ -296,6 +322,13 @@ void TesseractDecoder::initialize_structures(size_t num_detectors) {
   if (gari_monolithic_one_way_enabled) {
     beam_edets.resize(num_errors);
   }
+  if (gari_phase_mask_top_enabled) {
+    top_error_indices.reserve(num_errors);
+    bottom_error_indices.reserve(num_errors);
+    for (size_t ei = 0; ei < num_errors; ++ei) {
+      (error_is_physical[ei] ? bottom_error_indices : top_error_indices).push_back(ei);
+    }
+  }
 
   for (size_t ei = 0; ei < num_errors; ++ei) {
     edets[ei] = errors[ei].symptom.detectors;
@@ -316,9 +349,41 @@ void TesseractDecoder::initialize_structures(size_t num_detectors) {
   }
 
   for (size_t d = 0; d < num_detectors; ++d) {
-    std::sort(d2e[d].begin(), d2e[d].end(), [this](size_t idx_a, size_t idx_b) {
+    std::sort(d2e[d].begin(), d2e[d].end(), [this, d](size_t idx_a, size_t idx_b) {
+      if (gari_phase_mask_top_enabled && d < beam_detector_count) {
+        const double cost_a =
+            errors[idx_a].likelihood_cost / beam_edets[idx_a].size();
+        const double cost_b =
+            errors[idx_b].likelihood_cost / beam_edets[idx_b].size();
+        return cost_a < cost_b;
+      }
       return error_costs[idx_a].min_cost < error_costs[idx_b].min_cost;
     });
+  }
+
+  if (gari_phase_mask_top_enabled) {
+    top_eneighbors.resize(num_errors);
+    std::vector<boost::dynamic_bitset<>> top_edets_bitsets(
+        num_errors, boost::dynamic_bitset<>(beam_detector_count));
+    for (size_t ei = 0; ei < num_errors; ++ei) {
+      for (int d : beam_edets[ei]) {
+        top_edets_bitsets[ei][d] = 1;
+      }
+    }
+    for (size_t ei = 0; ei < num_errors; ++ei) {
+      if (beam_edets[ei].empty()) continue;
+      boost::dynamic_bitset<> neighbor_set(beam_detector_count);
+      for (int d : beam_edets[ei]) {
+        for (int oei : d2e[d]) {
+          neighbor_set |= top_edets_bitsets[oei];
+        }
+      }
+      neighbor_set &= ~top_edets_bitsets[ei];
+      for (size_t d = neighbor_set.find_first(); d != boost::dynamic_bitset<>::npos;
+           d = neighbor_set.find_next(d)) {
+        top_eneighbors[ei].push_back(d);
+      }
+    }
   }
 
   eneighbors.resize(num_errors);
@@ -513,6 +578,12 @@ void TesseractDecoder::decode_to_errors_with_graph(
                                  ? config.gari_monolithic_one_way->bottom_beam
                                  : INF_DET_BEAM;
   const bool bottom_beam_enabled = bottom_beam < INF_DET_BEAM;
+  const bool phase_mask_top = gari_phase_mask_top_enabled;
+  const size_t max_debt_states = gari_monolithic_one_way_enabled
+                                     ? config.gari_monolithic_one_way->max_debt_states
+                                     : std::numeric_limits<size_t>::max();
+  const bool debt_state_limit_enabled =
+      phase_mask_top && max_debt_states != std::numeric_limits<size_t>::max();
   struct BottomBeamContext {
     size_t min_virtual_dets;
   };
@@ -525,6 +596,12 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
   std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
   std::unordered_map<size_t, std::unordered_set<boost::dynamic_bitset<>>> visited_detectors;
+  using DebtBucket = std::vector<boost::dynamic_bitset<>>;
+  using DebtFrontier =
+      std::unordered_map<boost::dynamic_bitset<>, DebtBucket>;
+  std::vector<DebtFrontier> top_debt_frontiers(
+      debt_state_limit_enabled ? beam_detector_count + 1 : 0);
+  std::unordered_set<boost::dynamic_bitset<>> bottom_entry_debts;
 
   boost::dynamic_bitset<> initial_detectors(num_detectors, false);
   std::vector<DetectorCostTuple> initial_detector_cost_tuples(num_errors);
@@ -547,7 +624,10 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
   double initial_cost = 0;
   for (size_t d : detections) {
-    initial_cost += get_detcost(d, initial_detector_cost_tuples, active_d2e);
+    initial_cost +=
+        phase_mask_top
+            ? get_detcost(d, initial_detector_cost_tuples, active_d2e, beam_edets)
+            : get_detcost(d, initial_detector_cost_tuples, active_d2e);
   }
 
   if (initial_cost == INF) {
@@ -559,7 +639,54 @@ void TesseractDecoder::decode_to_errors_with_graph(
   size_t max_beam_dets = min_beam_dets + detector_beam;
 
   boost::dynamic_bitset<> next_detectors;
-  std::vector<DetectorCostTuple> next_detector_cost_tuples;
+  boost::dynamic_bitset<> detectors = initial_detectors;
+  std::vector<DetectorCostTuple> detector_cost_tuples(num_errors);
+  std::vector<DetectorCostTuple> next_detector_cost_tuples(num_errors);
+  std::vector<DetectorCostTuple> bottom_entry_cost_tuples(
+      phase_mask_top ? num_errors : 0);
+  std::vector<double> detector_cost_cache(num_detectors);
+  boost::dynamic_bitset<> real_state_scratch(
+      debt_state_limit_enabled ? beam_detector_count : 0);
+  boost::dynamic_bitset<> debt_state_scratch(
+      phase_mask_top ? num_detectors - beam_detector_count : 0);
+
+  auto load_real_state = [&](const boost::dynamic_bitset<>& detectors) {
+    real_state_scratch.reset();
+    for (size_t d = detectors.find_first(); d != boost::dynamic_bitset<>::npos &&
+                                                d < beam_detector_count;
+         d = detectors.find_next(d)) {
+      real_state_scratch[d] = 1;
+    }
+  };
+  auto load_debt_state = [&](const boost::dynamic_bitset<>& detectors) {
+    debt_state_scratch.reset();
+    size_t d = beam_detector_count == 0
+                   ? detectors.find_first()
+                   : detectors.find_next(beam_detector_count - 1);
+    for (; d != boost::dynamic_bitset<>::npos;
+         d = detectors.find_next(d)) {
+      debt_state_scratch[d - beam_detector_count] = 1;
+    }
+  };
+  auto bottom_entry_heuristic = [&](const boost::dynamic_bitset<>& detectors) {
+    for (size_t ei : bottom_error_indices) {
+      bottom_entry_cost_tuples[ei] = {};
+    }
+    for (size_t d = detectors.find_first(); d != boost::dynamic_bitset<>::npos;
+         d = detectors.find_next(d)) {
+      if (d < beam_detector_count) continue;
+      for (int ei : active_d2e[d]) {
+        ++bottom_entry_cost_tuples[ei].detectors_count;
+      }
+    }
+    double result = 0;
+    for (size_t d = detectors.find_first(); d != boost::dynamic_bitset<>::npos;
+         d = detectors.find_next(d)) {
+      if (d < beam_detector_count) continue;
+      result += get_detcost(d, bottom_entry_cost_tuples, active_d2e);
+    }
+    return result;
+  };
 
   pq.push({initial_cost, detections.size(), min_beam_dets, 0, -1});
   size_t num_pq_pushed = 1;
@@ -570,15 +697,19 @@ void TesseractDecoder::decode_to_errors_with_graph(
     const Node node = pq.top();
     pq.pop();
 
-    bool is_bottom_entry = false;
-    if (collect_one_way_stats && node.error_chain_idx != -1) {
-      bool last_error_is_physical =
+    bool last_error_is_physical = false;
+    if (gari_monolithic_one_way_enabled && node.error_chain_idx != -1) {
+      last_error_is_physical =
           error_is_physical[error_chain_arena[node.error_chain_idx].error_index];
+    }
+    bool is_bottom_entry = gari_monolithic_one_way_enabled && node.error_chain_idx != -1 &&
+                           node.beam_dets == 0 && node.num_dets > 0 &&
+                           !last_error_is_physical;
+    if (collect_one_way_stats && node.error_chain_idx != -1) {
       bool is_bottom_node =
           node.beam_dets == 0 && (node.num_dets > 0 || last_error_is_physical);
       if (is_bottom_node) {
         ++gari_monolithic_one_way_stats.bottom_queue_pops;
-        is_bottom_entry = node.num_dets > 0 && !last_error_is_physical;
       } else if (node.beam_dets > 0) {
         ++gari_monolithic_one_way_stats.top_queue_pops;
       }
@@ -603,10 +734,29 @@ void TesseractDecoder::decode_to_errors_with_graph(
       }
     }
 
-    boost::dynamic_bitset<> detectors = initial_detectors;
-    std::vector<DetectorCostTuple> detector_cost_tuples(num_errors);
+    const bool top_phase = phase_mask_top && node.beam_dets > 0;
+    const std::vector<size_t>* phase_error_indices =
+        !phase_mask_top
+            ? nullptr
+            : &(top_phase ? top_error_indices : bottom_error_indices);
+    detectors = initial_detectors;
+    if (phase_error_indices == nullptr) {
+      std::fill(detector_cost_tuples.begin(), detector_cost_tuples.end(),
+                DetectorCostTuple{});
+    } else {
+      for (size_t ei : *phase_error_indices) {
+        detector_cost_tuples[ei] = {};
+      }
+    }
     flip_detectors_and_block_errors(detector_order, node.error_chain_idx, detectors,
                                     detector_cost_tuples, active_d2e);
+
+    if (phase_mask_top && is_bottom_entry) {
+      load_debt_state(detectors);
+      if (!bottom_entry_debts.insert(debt_state_scratch).second) {
+        continue;
+      }
+    }
 
     if (node.num_dets == 0) {
       if (config.create_visualization) {
@@ -663,10 +813,35 @@ void TesseractDecoder::decode_to_errors_with_graph(
       continue;
     }
 
-    if (config.no_revisit_dets && !visited_detectors[node.beam_dets].insert(detectors).second)
+    if (debt_state_limit_enabled && node.beam_dets > 0) {
+      auto& frontier = top_debt_frontiers[node.beam_dets];
+      load_real_state(detectors);
+      auto frontier_it = frontier.find(real_state_scratch);
+      load_debt_state(detectors);
+      if (frontier_it == frontier.end()) {
+        DebtBucket debts;
+        debts.reserve(std::min(max_debt_states, size_t{4}));
+        debts.push_back(debt_state_scratch);
+        frontier.emplace(real_state_scratch, std::move(debts));
+      } else {
+        auto& debts = frontier_it->second;
+        if (std::find(debts.begin(), debts.end(), debt_state_scratch) != debts.end()) {
+          continue;
+        }
+        if (debts.size() >= max_debt_states) {
+          if (collect_one_way_stats) {
+            ++gari_monolithic_one_way_stats.top_debt_state_limit_prunes;
+          }
+          continue;
+        }
+        debts.push_back(debt_state_scratch);
+      }
+    } else if (config.no_revisit_dets &&
+               !visited_detectors[node.beam_dets].insert(detectors).second) {
       continue;
+    }
 
-    if (is_bottom_entry) {
+    if (collect_one_way_stats && is_bottom_entry) {
       ++gari_monolithic_one_way_stats.bottom_contexts_explored;
       // Retain only compact fingerprints so diagnostics do not copy every debt
       // bitset inside the measured decode interval.
@@ -713,17 +888,35 @@ void TesseractDecoder::decode_to_errors_with_graph(
           visited_detectors[i].clear();
         }
       }
+      if (debt_state_limit_enabled) {
+        const size_t first_cleared = min_beam_dets + detector_beam + 1;
+        const size_t last_cleared = std::min(max_beam_dets, beam_detector_count);
+        for (size_t i = first_cleared; i <= last_cleared; ++i) {
+          top_debt_frontiers[i].clear();
+        }
+      }
       max_beam_dets = std::min(max_beam_dets, min_beam_dets + detector_beam);
     }
 
-    for (size_t d = 0; d < num_detectors; ++d) {
-      if (!detectors[d]) continue;
+    const auto& cost_edets = top_phase ? beam_edets : edets;
+    const auto& cost_neighbors = top_phase ? top_eneighbors : eneighbors;
+
+    for (size_t d = detectors.find_first(); d != boost::dynamic_bitset<>::npos;
+         d = detectors.find_next(d)) {
+      if (top_phase && d >= beam_detector_count) break;
       for (int ei : active_d2e[d]) {
         ++detector_cost_tuples[ei].detectors_count;
       }
     }
 
-    next_detector_cost_tuples = detector_cost_tuples;
+    if (phase_error_indices == nullptr) {
+      next_detector_cost_tuples = detector_cost_tuples;
+    } else {
+      for (size_t ei : *phase_error_indices) {
+        next_detector_cost_tuples[ei] = detector_cost_tuples[ei];
+      }
+    }
+    next_detectors = detectors;
 
     size_t min_detector = std::numeric_limits<size_t>::max();
     for (size_t d = 0; d < num_detectors; ++d) {
@@ -734,13 +927,24 @@ void TesseractDecoder::decode_to_errors_with_graph(
     }
 
     size_t prev_ei = std::numeric_limits<size_t>::max();
-    std::vector<double> detector_cost_cache(num_detectors, -1);
+    if (!phase_mask_top) {
+      std::fill(detector_cost_cache.begin(), detector_cost_cache.end(), -1);
+    } else if (top_phase) {
+      std::fill(detector_cost_cache.begin(),
+                detector_cost_cache.begin() + beam_detector_count, -1);
+    } else {
+      std::fill(detector_cost_cache.begin() + beam_detector_count,
+                detector_cost_cache.end(), -1);
+    }
 
     for (int ei : active_d2e[min_detector]) {
       if (detector_cost_tuples[ei].error_blocked) continue;
 
       if (prev_ei != std::numeric_limits<size_t>::max()) {
         for (int d : edets[prev_ei]) {
+          next_detectors[d] = !next_detectors[d];
+        }
+        for (int d : cost_edets[prev_ei]) {
           int fired = detectors[d] ? 1 : -1;
           for (int oei : active_d2e[d]) {
             next_detector_cost_tuples[oei].detectors_count += fired;
@@ -749,7 +953,6 @@ void TesseractDecoder::decode_to_errors_with_graph(
       }
       prev_ei = ei;
 
-      next_detectors = detectors;
       next_detector_cost_tuples[ei].error_blocked = 1;
 
       double next_cost = node.cost + errors[ei].likelihood_cost;
@@ -757,8 +960,15 @@ void TesseractDecoder::decode_to_errors_with_graph(
 
       for (int d : edets[ei]) {
         next_detectors[d] = !next_detectors[d];
+      }
+      if (!top_phase) {
+        for (int d : edets[ei]) {
+          int fired = next_detectors[d] ? 1 : -1;
+          next_num_dets += fired;
+        }
+      }
+      for (int d : cost_edets[ei]) {
         int fired = next_detectors[d] ? 1 : -1;
-        next_num_dets += fired;
         for (int oei : active_d2e[d]) {
           next_detector_cost_tuples[oei].detectors_count += fired;
         }
@@ -771,31 +981,73 @@ void TesseractDecoder::decode_to_errors_with_graph(
           next_beam_dets += next_detectors[d] ? 1 : -1;
         }
       }
-
-      if (next_beam_dets > max_beam_dets) continue;
-
-      if (config.no_revisit_dets && visited_detectors[next_beam_dets].find(next_detectors) !=
-                                        visited_detectors[next_beam_dets].end())
-        continue;
-
-      for (int d : edets[ei]) {
-        if (detectors[d]) {
-          if (detector_cost_cache[d] == -1) {
-            detector_cost_cache[d] = get_detcost(d, detector_cost_tuples, active_d2e);
+      if (top_phase) {
+        next_num_dets = next_beam_dets;
+        if (next_beam_dets == 0) {
+          next_num_dets = 0;
+          for (size_t d = next_detectors.find_first();
+               d != boost::dynamic_bitset<>::npos; d = next_detectors.find_next(d)) {
+            if (d >= beam_detector_count) {
+              ++next_num_dets;
+            }
           }
-          next_cost -= detector_cost_cache[d];
-        } else {
-          next_cost += get_detcost(d, next_detector_cost_tuples, active_d2e);
         }
       }
 
-      for (int od : eneighbors[ei]) {
+      if (next_beam_dets > max_beam_dets) continue;
+
+      if (debt_state_limit_enabled && next_beam_dets > 0) {
+        load_real_state(next_detectors);
+        auto frontier = top_debt_frontiers[next_beam_dets].find(real_state_scratch);
+        if (frontier != top_debt_frontiers[next_beam_dets].end() &&
+            frontier->second.size() >= max_debt_states) {
+          if (collect_one_way_stats) {
+            ++gari_monolithic_one_way_stats.top_debt_state_limit_prunes;
+          }
+          continue;
+        }
+      }
+
+      if (config.no_revisit_dets &&
+          !(debt_state_limit_enabled && next_beam_dets > 0) &&
+          visited_detectors[next_beam_dets].find(next_detectors) !=
+              visited_detectors[next_beam_dets].end())
+        continue;
+
+      for (int d : cost_edets[ei]) {
+        if (detectors[d]) {
+          if (detector_cost_cache[d] == -1) {
+            detector_cost_cache[d] =
+                top_phase
+                    ? get_detcost(d, detector_cost_tuples, active_d2e, beam_edets)
+                    : get_detcost(d, detector_cost_tuples, active_d2e);
+          }
+          next_cost -= detector_cost_cache[d];
+        } else {
+          next_cost +=
+              top_phase
+                  ? get_detcost(d, next_detector_cost_tuples, active_d2e, beam_edets)
+                  : get_detcost(d, next_detector_cost_tuples, active_d2e);
+        }
+      }
+
+      for (int od : cost_neighbors[ei]) {
         if (!detectors[od] || !next_detectors[od]) continue;
         if (detector_cost_cache[od] == -1) {
-          detector_cost_cache[od] = get_detcost(od, detector_cost_tuples, active_d2e);
+          detector_cost_cache[od] =
+              top_phase
+                  ? get_detcost(od, detector_cost_tuples, active_d2e, beam_edets)
+                  : get_detcost(od, detector_cost_tuples, active_d2e);
         }
         next_cost -= detector_cost_cache[od];
-        next_cost += get_detcost(od, next_detector_cost_tuples, active_d2e);
+        next_cost +=
+            top_phase
+                ? get_detcost(od, next_detector_cost_tuples, active_d2e, beam_edets)
+                : get_detcost(od, next_detector_cost_tuples, active_d2e);
+      }
+
+      if (top_phase && next_beam_dets == 0 && next_num_dets > 0) {
+        next_cost += bottom_entry_heuristic(next_detectors);
       }
 
       if (next_cost == INF) continue;

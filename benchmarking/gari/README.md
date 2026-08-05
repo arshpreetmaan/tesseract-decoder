@@ -52,6 +52,7 @@ For a single constrained search over the full GARI model, use the mapped
   --det-mapping-file "<gari>/<stem>_two_stage_mapping.json" \
   --sample-num-shots 10 --sample-seed 0 --threads 1 \
   --beam 5 --num-det-orders 16 --det-order-bfs \
+  --gari-monolithic-debt-states 2 \
   --pqlimit 1000000 --stats-out "<one-way-stats>.json"
 ```
 
@@ -62,6 +63,16 @@ suffix. Barred columns remain selectable from real pivots and create their
 virtual identity debt, but virtual pivots expose physical columns only. The
 beam counts active real detectors, so accumulated debt does not by itself
 prune a top branch; debt repayment still contributes to queue priority.
+`--gari-monolithic-phase-mask` scores unfinished top nodes on the compact
+real/barred graph. Virtual debt is still tracked exactly, but enters the queue
+heuristic only when the real residual clears. `--gari-monolithic-debt-states
+D` enables that mask and retains at most `D` expanded distinct debts for each
+identical nonempty real residual. Contenders already waiting in the priority
+queue can temporarily exceed `D` until admission at expansion.
+Distinct debts reaching an empty real residual remain uncapped and enter the
+shared bottom search; exact duplicate entry debts are removed. These debt sets
+reset for every beam/order trial. Omitting both options preserves the original
+full-GARI bookkeeping.
 Add `--gari-monolithic-bottom-beam 2` to give each entered debt its own fixed
 virtual-detector beam; omitting it preserves the unbounded-bottom behavior.
 Completed trials are compared using original physical-error cost only, and

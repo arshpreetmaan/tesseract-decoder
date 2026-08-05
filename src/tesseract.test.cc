@@ -345,6 +345,73 @@ TEST(GariMonolithicOneWayTest, BottomBeamPrunesWithinButNotAcrossContexts) {
   EXPECT_EQ(candidates[1], (std::vector<size_t>{1, 2, 5, 6}));
 }
 
+TEST(GariMonolithicOneWayTest, LimitsDebtStatesForTheSameNonemptyRealResidual) {
+  stim::DetectorErrorModel dem(R"DEM(
+    error(0.001) D2
+    error(0.001) D3
+    error(0.001) D4
+    error(0.1) D0 D2
+    error(0.2) D0 D3
+    error(0.1) D1 D4
+  )DEM");
+  TesseractConfig config{dem};
+  config.det_orders = {{0, 1, 2, 3, 4}};
+  config.merge_errors = false;
+  config.no_revisit_dets = false;
+  config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
+      .real_detector_count = 2,
+      .physical_error_count = 3,
+      .phase_mask_top = true,
+      .max_debt_states = 2,
+      .collect_stats = true,
+  };
+  TesseractDecoder two_debt_decoder(config);
+  auto two_debt_candidates =
+      two_debt_decoder.decode_to_error_candidates({0, 1}, 0, 2, 2);
+
+  ASSERT_EQ(two_debt_candidates.size(), 2);
+  std::sort(two_debt_candidates.begin(), two_debt_candidates.end());
+  EXPECT_EQ(two_debt_candidates[0], (std::vector<size_t>{0, 2, 3, 5}));
+  EXPECT_EQ(two_debt_candidates[1], (std::vector<size_t>{1, 2, 4, 5}));
+
+  config.gari_monolithic_one_way->max_debt_states = 1;
+  TesseractDecoder one_debt_decoder(config);
+  auto one_debt_candidates =
+      one_debt_decoder.decode_to_error_candidates({0, 1}, 0, 2, 2);
+
+  ASSERT_EQ(one_debt_candidates.size(), 1);
+  EXPECT_EQ(one_debt_candidates[0], (std::vector<size_t>{1, 2, 4, 5}));
+  EXPECT_GT(one_debt_decoder.gari_monolithic_one_way_stats.top_debt_state_limit_prunes, 0);
+}
+
+TEST(GariMonolithicOneWayTest, DoesNotLimitDistinctDebtsAtTheBottomEntry) {
+  stim::DetectorErrorModel dem(R"DEM(
+    error(0.001) D1
+    error(0.001) D2
+    error(0.1) D0 D1
+    error(0.2) D0 D2
+  )DEM");
+  TesseractConfig config{dem};
+  config.det_orders = {{0, 1, 2}};
+  config.merge_errors = false;
+  config.no_revisit_dets = false;
+  config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
+      .real_detector_count = 1,
+      .physical_error_count = 2,
+      .phase_mask_top = true,
+      .max_debt_states = 1,
+      .collect_stats = true,
+  };
+  TesseractDecoder decoder(config);
+  auto candidates = decoder.decode_to_error_candidates({0}, 0, 1, 2);
+
+  ASSERT_EQ(candidates.size(), 2);
+  std::sort(candidates.begin(), candidates.end());
+  EXPECT_EQ(candidates[0], (std::vector<size_t>{0, 2}));
+  EXPECT_EQ(candidates[1], (std::vector<size_t>{1, 3}));
+  EXPECT_EQ(decoder.gari_monolithic_one_way_stats.top_debt_state_limit_prunes, 0);
+}
+
 bool simplex_test_compare(stim::DetectorErrorModel& dem, std::vector<stim::SparseShot>& shots) {
   TesseractConfig tesseract_config{dem};
   TesseractDecoder tesseract_decoder(tesseract_config);
