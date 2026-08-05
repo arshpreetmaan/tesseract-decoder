@@ -361,6 +361,80 @@ TesseractConfig top_child_config(const stim::DetectorErrorModel& dem,
 
 }  // namespace
 
+const char* gari_prior_policy_name(GariPriorPolicy policy) {
+  switch (policy) {
+    case GariPriorPolicy::ModeN:
+      return "modeN";
+    case GariPriorPolicy::ModePR:
+      return "modePR";
+  }
+  throw std::invalid_argument("Unknown GARI prior policy");
+}
+
+std::vector<double> reconstruct_gari_original_physical_costs(
+    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout) {
+  const stim::DetectorErrorModel flat_dem = gari_dem.flattened();
+  validate_layout(flat_dem, layout);
+
+  const size_t error_count = layout.physical_error_count + layout.barred_error_count;
+  std::vector<double> guide_costs(error_count);
+  std::vector<std::vector<size_t>> physical_virtual_targets(
+      layout.physical_error_count);
+  for_each_validated_gari_error(
+      flat_dem, layout,
+      [&](size_t error_index, const stim::DemInstruction& instruction,
+          ValidatedGariError&& error) {
+        const double probability = instruction.arg_data[0];
+        guide_costs[error_index] = std::log1p(-probability) - std::log(probability);
+        if (error_index < layout.physical_error_count) {
+          physical_virtual_targets[error_index] = std::move(error.virtual_targets);
+        }
+      });
+
+  std::vector<double> original_costs(
+      guide_costs.begin(), guide_costs.begin() + layout.physical_error_count);
+  if (layout.prior_policy == GariPriorPolicy::ModeN) {
+    return original_costs;
+  }
+
+  double cost_scale = 1;
+  for (double cost : guide_costs) {
+    cost_scale = std::max(cost_scale, std::abs(cost));
+  }
+  const double tolerance = 1e-10 * cost_scale;
+  for (double& cost : guide_costs) {
+    if (!std::isfinite(cost) || cost < -tolerance) {
+      throw std::invalid_argument(
+          "GARI modePR requires finite nonnegative residual and barred costs.");
+    }
+    cost = std::max(0.0, cost);
+  }
+
+  const size_t no_barred_error = std::numeric_limits<size_t>::max();
+  std::vector<size_t> virtual_to_barred(layout.virtual_detector_count,
+                                        no_barred_error);
+  for (size_t barred = 0; barred < layout.barred_error_count; ++barred) {
+    const size_t detector = layout.barred_error_to_virtual_detector[barred];
+    const size_t local_detector = detector - layout.physical_detector_count;
+    virtual_to_barred[local_detector] = barred;
+  }
+
+  for (size_t physical = 0; physical < layout.physical_error_count; ++physical) {
+    double cost = guide_costs[physical];
+    for (size_t detector : physical_virtual_targets[physical]) {
+      const size_t local_detector = detector - layout.physical_detector_count;
+      const size_t barred = virtual_to_barred.at(local_detector);
+      if (barred == no_barred_error) {
+        throw std::invalid_argument(
+            "GARI modePR physical error targets an unmapped virtual detector.");
+      }
+      cost += guide_costs[layout.physical_error_count + barred];
+    }
+    original_costs[physical] = cost;
+  }
+  return original_costs;
+}
+
 class GariTwoStageTesseractDecoder::BottomMatchingDecoder {
  public:
   struct Result {
@@ -398,11 +472,7 @@ class GariTwoStageTesseractDecoder::BottomMatchingDecoder {
 
 void validate_gari_monolithic_one_way_model(
     const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout) {
-  const stim::DetectorErrorModel flat_dem = gari_dem.flattened();
-  validate_layout(flat_dem, layout);
-  for_each_validated_gari_error(
-      flat_dem, layout,
-      [](size_t, const stim::DemInstruction&, ValidatedGariError&&) {});
+  (void)reconstruct_gari_original_physical_costs(gari_dem, layout);
 }
 
 std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
@@ -417,6 +487,8 @@ std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(
   }
   auto prepared = std::make_shared<GariTwoStagePreparedModel>();
   prepared->layout = layout;
+  prepared->original_physical_costs =
+      reconstruct_gari_original_physical_costs(flat_dem, layout);
   const size_t physical_detectors = layout.physical_detector_count;
 
   prepared->top_error_to_bottom_detector.reserve(layout.barred_error_count);
@@ -536,6 +608,12 @@ GariTwoStageTesseractDecoder::GariTwoStageTesseractDecoder(
   }
   if (config_.num_bottom_detector_orders == 0 || config_.num_bottom_detector_orders > 2) {
     throw std::invalid_argument("GARI bottom detector-order count must be 1 or 2.");
+  }
+  if (layout.prior_policy == GariPriorPolicy::ModePR &&
+      config_.bottom_backend == GariBottomBackend::PyMatching) {
+    throw std::invalid_argument(
+        "The PyMatching GARI bottom backend is unavailable with modePR because "
+        "it does not return physical errors for original-cost reranking.");
   }
   if (config_.bottom_backend == GariBottomBackend::PyMatching &&
       (config_.bottom_beam != 2 || config_.num_bottom_detector_orders != 1)) {
@@ -680,6 +758,32 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
       ++result.bottom_cache_hits;
       outcome = cached->second;
     } else {
+      auto consider_tesseract_bottom = [&]() {
+        if (bottom_decoder_->low_confidence_flag) {
+          return;
+        }
+        std::vector<size_t> errors = bottom_decoder_->predicted_errors_buffer;
+        if (!reproduces_syndrome(prepared_model_->bottom_error_detectors, errors, debt,
+                                 layout.virtual_detector_count)) {
+          throw std::runtime_error(
+              "Completed bottom GARI candidate does not reproduce its debt syndrome.");
+        }
+        double cost = 0;
+        if (layout.prior_policy == GariPriorPolicy::ModePR) {
+          for (size_t error : errors) {
+            cost += prepared_model_->original_physical_costs.at(error);
+          }
+        } else {
+          cost = bottom_decoder_->cost_from_errors(errors);
+        }
+        if (!outcome.completed || cost < outcome.cost) {
+          outcome.completed = true;
+          outcome.cost = cost;
+          outcome.errors = std::move(errors);
+          outcome.observables =
+              bottom_decoder_->get_flipped_observables(outcome.errors);
+        }
+      };
       auto decode_bottom = [&]() {
         if (config_.bottom_backend == GariBottomBackend::PyMatching) {
           auto matching_result = bottom_matching_decoder_->decode(debt);
@@ -691,8 +795,15 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
           if (config_.num_bottom_detector_orders == 1) {
             bottom_decoder_->decode_to_errors(debt, /*detector_order=*/0,
                                               config_.bottom_beam);
+            consider_tesseract_bottom();
           } else {
-            bottom_decoder_->decode_to_errors(debt);
+            for (size_t detector_order = 0;
+                 detector_order < config_.num_bottom_detector_orders;
+                 ++detector_order) {
+              bottom_decoder_->decode_to_errors(
+                  debt, detector_order, config_.bottom_beam);
+              consider_tesseract_bottom();
+            }
           }
         }
       };
@@ -700,24 +811,13 @@ GariTwoStageDecodeResult GariTwoStageTesseractDecoder::decode(
         const auto start = std::chrono::steady_clock::now();
         decode_bottom();
         result.bottom_decode_time_seconds +=
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start)
+                .count();
       } else {
         decode_bottom();
       }
 
-      if (config_.bottom_backend == GariBottomBackend::Tesseract) {
-        outcome.completed = !bottom_decoder_->low_confidence_flag;
-        if (outcome.completed) {
-          outcome.errors = bottom_decoder_->predicted_errors_buffer;
-          if (!reproduces_syndrome(prepared_model_->bottom_error_detectors, outcome.errors, debt,
-                                   layout.virtual_detector_count)) {
-            throw std::runtime_error(
-                "Completed bottom GARI candidate does not reproduce its debt syndrome.");
-          }
-          outcome.cost = bottom_decoder_->cost_from_errors(outcome.errors);
-          outcome.observables = bottom_decoder_->get_flipped_observables(outcome.errors);
-        }
-      }
       bottom_cache.emplace(debt, outcome);
     }
 

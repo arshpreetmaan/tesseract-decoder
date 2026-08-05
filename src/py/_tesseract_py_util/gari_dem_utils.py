@@ -394,6 +394,66 @@ def assign_prior_weights(gari_structure: dict, method: str, original_priors: np.
         [None, I_nz],
         [U.T,  V.T]
     ], format='csc')
+
+    if method == "modePR":
+        if not np.all(np.isfinite(P_real_orig)) or not np.all(
+            (P_real_orig > 0) & (P_real_orig <= 0.5)
+        ):
+            raise ValueError("modePR probabilities must be finite and in (0, 0.5]")
+        source_costs = np.log1p(-P_real_orig) - np.log(P_real_orig)
+        if N_virtual == 0:
+            return P_real_orig.copy()
+
+        # PR-273's lexicographic LP first maximizes a common floor across the
+        # residual physical costs c - A g and the barred costs g.
+        floor_constraints = bmat([
+            [A_ub_orig, np.ones((N_real, 1))],
+            [-speye(N_virtual, format='csc'), np.ones((N_virtual, 1))],
+        ], format='csc')
+        floor_objective = np.zeros(N_virtual + 1, dtype=np.float64)
+        floor_objective[-1] = -1
+        floor_result = linprog(
+            floor_objective,
+            A_ub=floor_constraints,
+            b_ub=np.concatenate([source_costs, np.zeros(N_virtual)]),
+            bounds=(0, None),
+            method='highs',
+        )
+        if not floor_result.success:
+            raise RuntimeError(
+                "modePR floor solver failed: " + str(floor_result.message)
+            )
+        tolerance = 1e-7 * max(
+            1.0, float(np.max(source_costs, initial=0.0))
+        )
+        cost_floor = max(0.0, float(floor_result.x[-1]) - tolerance)
+
+        # Preserve that floor, then maximize the total barred cost.
+        result = linprog(
+            -np.ones(N_virtual, dtype=np.float64),
+            A_ub=A_ub_orig,
+            b_ub=source_costs - cost_floor,
+            bounds=(cost_floor, None),
+            method='highs',
+        )
+        if not result.success:
+            raise RuntimeError(
+                "modePR barred-cost solver failed: " + str(result.message)
+            )
+        barred_costs = np.asarray(result.x)
+        residual_costs = source_costs - np.asarray(
+            A_ub_orig @ barred_costs
+        ).reshape(-1)
+        if (
+            np.min(barred_costs) < cost_floor - tolerance
+            or np.min(residual_costs) < cost_floor - tolerance
+        ):
+            raise RuntimeError("modePR solver returned an infeasible solution")
+        gari_costs = np.concatenate([
+            np.maximum(residual_costs, 0.0),
+            np.maximum(barred_costs, 0.0),
+        ])
+        return np.exp(-np.logaddexp(0, gari_costs))
     
     col_ones_real = np.ones((N_real, 1))
     A_upper = hstack([A_ub_orig, col_ones_real], format='csc')
@@ -720,8 +780,12 @@ def get_detector_orderings(gari_structure: dict, det_types: np.ndarray, ordering
     raise ValueError(f"Unknown ordering {ordering_name}")
 
 
-def get_two_stage_layout(gari_structure: dict, dem_file: str) -> dict:
+def get_two_stage_layout(
+    gari_structure: dict, dem_file: str, top_prior_policy: str = "modeN"
+) -> dict:
     """Describes the fixed GARI block layout using full DEM indices."""
+    if top_prior_policy not in ("modeN", "modePR"):
+        raise ValueError(f"Unsupported two-stage prior policy {top_prior_policy}")
     nx = int(gari_structure["nx_virt"])
     nz = int(gari_structure["nz_virt"])
     nx_real = int(gari_structure["nx_real"])
@@ -778,12 +842,14 @@ def get_two_stage_layout(gari_structure: dict, dem_file: str) -> dict:
             raise ValueError(f"barred error {error} has an unexpected virtual target")
         barred_to_virtual.append({"error": error, "detector": detector})
 
-    return {
+    layout = {
         "schema": "gari_two_stage_layout",
         "version": 1,
         "dem_file": dem_file,
-        "top_prior_policy": "modeN",
-        "bottom_prior_policy": "original",
+        "top_prior_policy": top_prior_policy,
+        "bottom_prior_policy": (
+            "original" if top_prior_policy == "modeN" else "lp_residual"
+        ),
         "detectors": {
             "physical": {"offset": 0, "count": physical_detectors},
             "virtual": {"offset": physical_detectors, "count": virtual_detectors},
@@ -816,9 +882,17 @@ def get_two_stage_layout(gari_structure: dict, dem_file: str) -> dict:
         },
         "barred_error_to_virtual_detector": barred_to_virtual,
     }
+    if top_prior_policy == "modePR":
+        layout.update({
+            "prior_policy_id": "lp_floor_then_max_barred_v1",
+            "final_cost_policy": "reconstructed_original_physical",
+        })
+    return layout
 
 
-def process_directory(input_path, two_stage_only=False):
+def process_directory(input_path, two_stage_only=False, two_stage_prior="modeN"):
+    if two_stage_prior not in ("modeN", "modePR", "both"):
+        raise ValueError(f"Unknown two-stage prior selection {two_stage_prior}")
     input_path = get_target_path(input_path)
     if os.path.isdir(input_path):
         stim_files = glob.glob(os.path.join(input_path, "**", "*.stim"), recursive=True)
@@ -862,10 +936,20 @@ def process_directory(input_path, two_stage_only=False):
             #     "modeO", "modeP", "modeQ", "modeR", "modeS", "modeU",
             #     "modeV", "modeS2", "modeSO", "modeSO2"
             # ]
-            modes_to_generate = ["modeN"] if two_stage_only else [
-                "modeA", "modeN", "modeO", "modeQ", "modeR", "modeS",
-                "modeS2", "modeSO", "modeSO2"
-            ]
+            selected_two_stage_modes = {
+                "modeN": ["modeN"],
+                "modePR": ["modePR"],
+                "both": ["modeN", "modePR"],
+            }[two_stage_prior]
+            if two_stage_only:
+                modes_to_generate = selected_two_stage_modes
+            else:
+                modes_to_generate = [
+                    "modeA", "modeN", "modeO", "modeQ", "modeR", "modeS",
+                    "modeS2", "modeSO", "modeSO2"
+                ]
+                if "modePR" in selected_two_stage_modes:
+                    modes_to_generate.append("modePR")
             
             for mode_name in modes_to_generate:
                 try:
@@ -892,25 +976,41 @@ def process_directory(input_path, two_stage_only=False):
             for gari_idx, orig_idx in enumerate(z_orig_indices):
                 mapping[int(orig_idx)] = int(nx + gari_idx)
                 
-            mapping_dict = {
+            mapping_base = {
                 "num_original_detectors": dem.num_detectors,
                 "mapping": mapping,
-                "gari_two_stage": get_two_stage_layout(
-                    gari_structure, f"{stim_stem}_ogL_modeN.dem"
-                ),
             }
             if not two_stage_only:
                 order_names = ("order2", "order4", "order7", "order9", "order10")
-                mapping_dict["det_orders"] = {
+                mapping_base["det_orders"] = {
                     name: [
                         int(x)
                         for x in get_detector_orderings(gari_structure, det_types, name)
                     ]
                     for name in order_names
                 }
-            mapping_suffix = "_two_stage_mapping.json" if two_stage_only else "_mapping.json"
-            with open(base_path + mapping_suffix, "w") as f:
-                json.dump(mapping_dict, f, indent=2)
+
+            # Preserve the existing mode-N names. Mode PR uses a distinct
+            # mapping so its residual physical weights cannot be mistaken for
+            # the original physical weights stored by mode N.
+            if not two_stage_only or "modeN" in selected_two_stage_modes:
+                mode_n_mapping = dict(mapping_base)
+                mode_n_mapping["gari_two_stage"] = get_two_stage_layout(
+                    gari_structure, f"{stim_stem}_ogL_modeN.dem", "modeN"
+                )
+                mapping_suffix = (
+                    "_two_stage_mapping.json" if two_stage_only else "_mapping.json"
+                )
+                with open(base_path + mapping_suffix, "w") as f:
+                    json.dump(mode_n_mapping, f, indent=2)
+
+            if "modePR" in selected_two_stage_modes:
+                mode_pr_mapping = dict(mapping_base)
+                mode_pr_mapping["gari_two_stage"] = get_two_stage_layout(
+                    gari_structure, f"{stim_stem}_ogL_modePR.dem", "modePR"
+                )
+                with open(base_path + "_two_stage_modePR_mapping.json", "w") as f:
+                    json.dump(mode_pr_mapping, f, indent=2)
                 
             print(f"Successfully processed {stim_path}")
         except Exception as e:
@@ -923,7 +1023,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--two-stage-only",
         action="store_true",
-        help="Generate only the mode-N physical-logical DEM and compact two-stage mapping",
+        help="Generate only the selected physical-logical DEM and compact mapping",
+    )
+    parser.add_argument(
+        "--two-stage-prior",
+        choices=("modeN", "modePR", "both"),
+        default="modeN",
+        help=(
+            "Compact prior policy (default: modeN). With full generation, "
+            "modePR or both additionally generates mode PR artifacts."
+        ),
     )
     args = parser.parse_args()
-    process_directory(args.input_path, two_stage_only=args.two_stage_only)
+    process_directory(
+        args.input_path,
+        two_stage_only=args.two_stage_only,
+        two_stage_prior=args.two_stage_prior,
+    )

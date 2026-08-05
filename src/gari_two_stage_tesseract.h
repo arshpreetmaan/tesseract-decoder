@@ -31,6 +31,13 @@ struct GariTopComponentsLayout {
   GariTopComponentLayout d_z;
 };
 
+enum class GariPriorPolicy {
+  ModeN,
+  ModePR,
+};
+
+const char* gari_prior_policy_name(GariPriorPolicy policy);
+
 struct GariTwoStageLayout {
   size_t physical_detector_count = 0;
   size_t virtual_detector_count = 0;
@@ -38,6 +45,7 @@ struct GariTwoStageLayout {
   size_t barred_error_count = 0;
   std::vector<size_t> barred_error_to_virtual_detector;
   std::optional<GariTopComponentsLayout> top_components;
+  GariPriorPolicy prior_policy = GariPriorPolicy::ModeN;
 };
 
 struct GariPreparedTopComponent {
@@ -55,6 +63,9 @@ struct GariTwoStagePreparedModel {
   std::vector<size_t> top_error_to_bottom_detector;
   std::vector<std::vector<size_t>> top_error_detectors;
   std::vector<std::vector<size_t>> bottom_error_detectors;
+  // Original physical LLRs. In mode PR these are reconstructed from the
+  // residual physical and incident barred guide costs in the GARI DEM.
+  std::vector<double> original_physical_costs;
 
   // Populated before workers when the direct-sum D_X/D_Z split is requested.
   GariPreparedTopComponent d_x_top;
@@ -64,6 +75,9 @@ struct GariTwoStagePreparedModel {
 // Validates the flattened monolithic GARI block structure used by the
 // one-way search. This performs no decoder construction or DEM partitioning.
 void validate_gari_monolithic_one_way_model(
+    const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout);
+
+std::vector<double> reconstruct_gari_original_physical_costs(
     const stim::DetectorErrorModel& gari_dem, const GariTwoStageLayout& layout);
 
 std::shared_ptr<const GariTwoStagePreparedModel> prepare_gari_two_stage_model(

@@ -40,6 +40,9 @@ int suggest_sparsify_reactivate_limit(size_t num_detectors, int sparsify_base_de
 struct GariMonolithicOneWayConfig {
   size_t real_detector_count = 0;
   size_t physical_error_count = 0;
+  // Indexed by original flattened DEM physical-error index. Empty preserves
+  // the legacy behavior of taking final costs directly from the GARI DEM.
+  std::vector<double> original_physical_costs;
   size_t bottom_beam = INF_DET_BEAM;
   double continuation_factor = 0;
   bool collect_stats = false;
@@ -204,6 +207,8 @@ struct TesseractDecoder {
   std::vector<DetectorCostTuple> gari_detector_cost_tuples;
   std::vector<DetectorCostTuple> gari_next_detector_cost_tuples;
   std::vector<double> gari_detector_cost_cache;
+  // Indexed by retained decoder error after optional error merging.
+  std::vector<double> gari_original_physical_costs_by_error;
   size_t beam_detector_count = 0;
   bool gari_monolithic_one_way_enabled = false;
   std::unordered_map<boost::dynamic_bitset<>, GariBottomCacheEntry, DynamicBitsetHash>

@@ -28,6 +28,10 @@
 
 constexpr uint64_t test_data_seed = 752024;
 
+double probability_from_llr(double cost) {
+  return 1 / (1 + std::exp(cost));
+}
+
 TEST(GariTwoStageTesseractTest, CompletesAndCachesPhysicalSolution) {
   stim::DetectorErrorModel dem(R"DEM(
     error(0.1) D2 L0 L70
@@ -161,6 +165,53 @@ TEST(GariTwoStageTesseractTest, AdditionalTopCandidateImprovesPhysicalCost) {
   EXPECT_EQ(two_candidates.observables, (std::vector<int>{1}));
   EXPECT_NEAR(two_candidates.physical_cost, -std::log(0.20 / 0.80), EPSILON);
   EXPECT_EQ(two_candidates.unique_debts, 2);
+}
+
+TEST(GariTwoStageTesseractTest, ModePrReranksUsingReconstructedPhysicalCost) {
+  stim::DetectorErrorModel dem;
+  auto append = [&](double cost, std::vector<stim::DemTarget> targets) {
+    dem.append_error_instruction(probability_from_llr(cost), targets, "");
+  };
+  append(0.1, {stim::DemTarget::relative_detector_id(1),
+               stim::DemTarget::observable_id(0)});
+  append(1.0, {stim::DemTarget::relative_detector_id(2),
+               stim::DemTarget::observable_id(1)});
+  append(2.0, {stim::DemTarget::relative_detector_id(0),
+               stim::DemTarget::relative_detector_id(1)});
+  append(0.1, {stim::DemTarget::relative_detector_id(0),
+               stim::DemTarget::relative_detector_id(2)});
+  GariTwoStageLayout layout = {
+      .physical_detector_count = 1,
+      .virtual_detector_count = 2,
+      .physical_error_count = 2,
+      .barred_error_count = 2,
+      .barred_error_to_virtual_detector = {1, 2},
+      .prior_policy = GariPriorPolicy::ModePR,
+  };
+  auto prepared_model = prepare_gari_two_stage_model(dem, layout);
+  ASSERT_EQ(prepared_model->original_physical_costs.size(), 2);
+  EXPECT_NEAR(prepared_model->original_physical_costs[0], 2.1, EPSILON);
+  EXPECT_NEAR(prepared_model->original_physical_costs[1], 1.1, EPSILON);
+
+  GariTwoStageConfig config;
+  config.max_top_beam = 0;
+  config.num_top_detector_orders = 1;
+  config.top_detector_orders = {{0}};
+  config.top_candidates_per_trial = 2;
+  config.bottom_beam = 0;
+  config.num_bottom_detector_orders = 2;
+  GariTwoStageTesseractDecoder decoder(prepared_model, config);
+  auto result = decoder.decode({0});
+
+  ASSERT_TRUE(result.completed);
+  EXPECT_EQ(result.top_errors, (std::vector<size_t>{1}));
+  EXPECT_EQ(result.physical_errors, (std::vector<size_t>{1}));
+  EXPECT_EQ(result.observables, (std::vector<int>{1}));
+  EXPECT_NEAR(result.physical_cost, 1.1, EPSILON);
+
+  config.bottom_backend = GariBottomBackend::PyMatching;
+  EXPECT_THROW(GariTwoStageTesseractDecoder(prepared_model, config),
+               std::invalid_argument);
 }
 
 TEST(GariTwoStageTesseractTest, SplitTopCrossProductReranksPhysicalCost) {
@@ -385,6 +436,55 @@ TEST(GariMonolithicOneWayTest, ContinuesTopQueueUsingPhysicalCostFeedback) {
       1);
   EXPECT_EQ(decoder.gari_monolithic_one_way_stats.unique_bottom_debts_explored,
             2);
+}
+
+TEST(GariMonolithicOneWayTest, ModePrMergesOriginalPhysicalCosts) {
+  stim::DetectorErrorModel dem;
+  auto append = [&](double cost, std::vector<stim::DemTarget> targets) {
+    dem.append_error_instruction(probability_from_llr(cost), targets, "");
+  };
+  append(0.5, {stim::DemTarget::relative_detector_id(1)});
+  append(0.6, {stim::DemTarget::relative_detector_id(2)});
+  append(0.4, {stim::DemTarget::relative_detector_id(1),
+               stim::DemTarget::relative_detector_id(2),
+               stim::DemTarget::observable_id(0)});
+  append(0.8, {stim::DemTarget::relative_detector_id(1),
+               stim::DemTarget::relative_detector_id(2),
+               stim::DemTarget::observable_id(0)});
+  append(0.2, {stim::DemTarget::relative_detector_id(0),
+               stim::DemTarget::relative_detector_id(1)});
+  append(0.3, {stim::DemTarget::relative_detector_id(0),
+               stim::DemTarget::relative_detector_id(2)});
+  GariTwoStageLayout layout = {
+      .physical_detector_count = 1,
+      .virtual_detector_count = 2,
+      .physical_error_count = 4,
+      .barred_error_count = 2,
+      .barred_error_to_virtual_detector = {1, 2},
+      .prior_policy = GariPriorPolicy::ModePR,
+  };
+  std::vector<double> original_costs =
+      reconstruct_gari_original_physical_costs(dem, layout);
+  ASSERT_EQ(original_costs.size(), 4);
+  EXPECT_NEAR(original_costs[2], 0.9, EPSILON);
+  EXPECT_NEAR(original_costs[3], 1.3, EPSILON);
+
+  TesseractConfig config{dem};
+  config.merge_errors = true;
+  config.det_orders = {{0, 1, 2}};
+  config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
+      .real_detector_count = 1,
+      .physical_error_count = 4,
+      .original_physical_costs = original_costs,
+  };
+  TesseractDecoder decoder(config);
+
+  EXPECT_NEAR(decoder.cost_from_errors({2}),
+              common::merge_weights(0.4, 0.8), EPSILON);
+  EXPECT_NEAR(decoder.solution_cost_from_errors({2}),
+              common::merge_weights(0.9, 1.3), EPSILON);
+  EXPECT_NEAR(decoder.solution_cost_from_errors({2, 4, 5}),
+              common::merge_weights(0.9, 1.3), EPSILON);
 }
 
 bool simplex_test_compare(stim::DetectorErrorModel& dem, std::vector<stim::SparseShot>& shots) {

@@ -28,6 +28,20 @@ This writes or updates only `<circuit-directory>/gari/<stem>_ogL_modeN.dem` and
 artifacts are left untouched. The compact JSON omits the legacy custom detector
 orders; both modes generate their real-detector orders in memory.
 
+To generate the PR-273 LP guide instead, select `modePR` explicitly:
+
+```bash
+bazel run --jobs=1 //src/py/_tesseract_py_util:gari_dem_utils -- \
+  "<circuit>.stim" --two-stage-only --two-stage-prior modePR
+```
+
+This writes `<stem>_ogL_modePR.dem` and
+`<stem>_two_stage_modePR_mapping.json`. Use those two files in the decoder
+commands below. `--two-stage-prior both` writes both compact prior variants.
+Mode PR uses LP-partitioned barred and residual costs to guide the search, but
+completed candidates are still compared using reconstructed original physical
+costs. Its bottom must currently use Tesseract, not PyMatching.
+
 A fixed beam with one top order performs one top-and-bottom pass:
 
 ```bash

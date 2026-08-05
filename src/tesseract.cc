@@ -200,6 +200,11 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
       throw std::invalid_argument(
           "GARI physical_error_count cannot exceed the original DEM error count.");
     }
+    if (!one_way.original_physical_costs.empty() &&
+        one_way.original_physical_costs.size() != one_way.physical_error_count) {
+      throw std::invalid_argument(
+          "GARI original physical cost count must equal physical_error_count.");
+    }
     if (!std::isfinite(one_way.continuation_factor) ||
         one_way.continuation_factor < 0) {
       throw std::invalid_argument(
@@ -227,6 +232,29 @@ TesseractDecoder::TesseractDecoder(TesseractConfig config_) : config(std::move(c
         throw std::invalid_argument(
             "GARI preprocessing merged physical and barred errors across the configured error "
             "boundary.");
+      }
+    }
+    if (!one_way.original_physical_costs.empty()) {
+      const double unset_cost = std::numeric_limits<double>::quiet_NaN();
+      gari_original_physical_costs_by_error.assign(config.dem.count_errors(), unset_cost);
+      for (size_t original_error_index = 0;
+           original_error_index < one_way.physical_error_count;
+           ++original_error_index) {
+        const double original_cost =
+            one_way.original_physical_costs[original_error_index];
+        if (!std::isfinite(original_cost)) {
+          throw std::invalid_argument(
+              "GARI original physical costs must be finite.");
+        }
+        const size_t error_index = dem_error_to_error[original_error_index];
+        if (error_index == std::numeric_limits<size_t>::max()) {
+          continue;
+        }
+        double& retained_cost =
+            gari_original_physical_costs_by_error[error_index];
+        retained_cost = std::isnan(retained_cost)
+                            ? original_cost
+                            : common::merge_weights(retained_cost, original_cost);
       }
     }
   }
@@ -1196,9 +1224,9 @@ void TesseractDecoder::decode_gari_monolithic_one_way_with_graph(
           ++gari_monolithic_one_way_stats.bottom_cache_hits;
         }
       } else {
-        const double bottom_initial_cost =
+        const double bottom_residual_initial_cost =
             initial_phase_cost(bottom_state, edets, bottom_error_indices);
-        if (bottom_initial_cost == INF) {
+        if (bottom_residual_initial_cost == INF) {
           bottom_completed = false;
         } else {
           // A nested bottom search may append many temporary error-chain
@@ -1207,8 +1235,14 @@ void TesseractDecoder::decode_gari_monolithic_one_way_with_graph(
           const size_t arena_checkpoint = error_chain_arena.size();
           const size_t bottom_pops_before =
               gari_monolithic_one_way_stats.bottom_queue_pops;
+          const double committed_top_guide_cost =
+              one_way_config.original_physical_costs.empty()
+                  ? 0
+                  : top_solution.cost;
           std::optional<Node> bottom_solution = run_phase(
-              bottom_state, bottom_initial_cost, one_way_config.bottom_beam,
+              bottom_state,
+              committed_top_guide_cost + bottom_residual_initial_cost,
+              one_way_config.bottom_beam,
               edets, eneighbors, bottom_error_indices, beam_detector_count,
               num_detectors, top_solution.error_chain_idx, top_solution.depth,
               top_solution.error_chain_idx, false);
@@ -1336,7 +1370,17 @@ double TesseractDecoder::solution_cost_from_errors(
       throw std::invalid_argument("error index does not map to a retained decoder error");
     }
     if (dem_error_index < physical_error_count) {
-      total_cost += errors[error_index].likelihood_cost;
+      if (gari_original_physical_costs_by_error.empty()) {
+        total_cost += errors[error_index].likelihood_cost;
+      } else {
+        const double original_cost =
+            gari_original_physical_costs_by_error.at(error_index);
+        if (!std::isfinite(original_cost)) {
+          throw std::runtime_error(
+              "A retained GARI physical error has no original physical cost.");
+        }
+        total_cost += original_cost;
+      }
     }
   }
   return total_cost;

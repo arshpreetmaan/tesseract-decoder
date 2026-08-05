@@ -41,14 +41,37 @@ GariTwoStageLayout parse_gari_two_stage_layout(const nlohmann::json& root,
   if (layout.at("schema") != "gari_two_stage_layout" || layout.at("version") != 1) {
     throw std::invalid_argument("Unsupported GARI two-stage layout schema");
   }
-  if (layout.at("top_prior_policy") != "modeN" ||
-      layout.at("bottom_prior_policy") != "original" ||
-      layout.at("dem_file") != std::filesystem::path(dem_path).filename().string()) {
+  if (layout.at("dem_file") != std::filesystem::path(dem_path).filename().string()) {
     throw std::invalid_argument(
-        "GARI two-stage decoding requires the mapped physical-logical mode-N DEM");
+        "GARI two-stage mapping does not describe the selected DEM");
   }
 
   GariTwoStageLayout result;
+  const std::string top_prior_policy =
+      layout.at("top_prior_policy").get<std::string>();
+  const std::string bottom_prior_policy =
+      layout.at("bottom_prior_policy").get<std::string>();
+  if (top_prior_policy == "modeN") {
+    if (bottom_prior_policy != "original") {
+      throw std::invalid_argument(
+          "GARI modeN requires bottom_prior_policy=original");
+    }
+    result.prior_policy = GariPriorPolicy::ModeN;
+  } else if (top_prior_policy == "modePR") {
+    if (bottom_prior_policy != "lp_residual" ||
+        layout.value("prior_policy_id", std::string()) !=
+            "lp_floor_then_max_barred_v1" ||
+        layout.value("final_cost_policy", std::string()) !=
+            "reconstructed_original_physical") {
+      throw std::invalid_argument(
+          "GARI modePR requires lp_residual, lp_floor_then_max_barred_v1, "
+          "and reconstructed_original_physical metadata");
+    }
+    result.prior_policy = GariPriorPolicy::ModePR;
+  } else {
+    throw std::invalid_argument("Unsupported GARI top prior policy: " +
+                                top_prior_policy);
+  }
   const auto& detectors = layout.at("detectors");
   const auto& physical_detectors = detectors.at("physical");
   const auto& virtual_detectors = detectors.at("virtual");
@@ -506,6 +529,14 @@ struct Args {
       det_mapping = j.at("mapping").get<std::vector<uint64_t>>();
       if (gari_two_stage || gari_monolithic_one_way) {
         gari_two_stage_layout = parse_gari_two_stage_layout(j, dem_path);
+        if (gari_two_stage &&
+            gari_two_stage_layout.prior_policy == GariPriorPolicy::ModePR &&
+            gari_bottom_decoder == "pymatching") {
+          throw std::invalid_argument(
+              "--gari-bottom-decoder pymatching is unavailable with modePR "
+              "because matching does not return physical errors for "
+              "original-cost reranking");
+        }
         if (gari_split_top && !gari_two_stage_layout.top_components.has_value()) {
           throw std::invalid_argument(
               "--gari-split-top requires a mapping containing "
@@ -591,10 +622,18 @@ struct Args {
     config.merge_errors = !no_merge_errors;
 
     if (gari_monolithic_one_way) {
-      validate_gari_monolithic_one_way_model(config.dem, gari_two_stage_layout);
+      std::vector<double> original_physical_costs;
+      if (gari_two_stage_layout.prior_policy == GariPriorPolicy::ModePR) {
+        original_physical_costs = reconstruct_gari_original_physical_costs(
+            config.dem, gari_two_stage_layout);
+      } else {
+        validate_gari_monolithic_one_way_model(config.dem,
+                                               gari_two_stage_layout);
+      }
       config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
           .real_detector_count = gari_two_stage_layout.physical_detector_count,
           .physical_error_count = gari_two_stage_layout.physical_error_count,
+          .original_physical_costs = std::move(original_physical_costs),
           .bottom_beam = gari_monolithic_bottom_beam,
           .continuation_factor = gari_monolithic_continuation_factor,
       };
@@ -792,7 +831,7 @@ int main(int argc, char* argv[]) {
       .default_value(std::string(""))
       .store_into(args.custom_order);
   program.add_argument("--gari-two-stage")
-      .help("Split a GARI physical-logical mode-N DEM into top and bottom decoders")
+      .help("Split a mapped physical-logical GARI DEM into top and bottom decoders")
       .flag()
       .store_into(args.gari_two_stage);
   program.add_argument("--gari-monolithic-one-way")
@@ -1293,6 +1332,8 @@ int main(int argc, char* argv[]) {
           gari_bottom_decode_time_seconds.begin(),
           gari_bottom_decode_time_seconds.begin() + shot, 0.0);
       stats_json["gari_two_stage"] = {
+          {"prior_policy",
+           gari_prior_policy_name(args.gari_two_stage_layout.prior_policy)},
           {"bottom_decoder", args.gari_bottom_decoder},
           {"bottom_beam", args.gari_bottom_beam},
           {"bottom_num_det_orders", args.gari_bottom_num_detector_orders},
@@ -1333,6 +1374,8 @@ int main(int argc, char* argv[]) {
             one_way_stats[i].bottom_nonprogress_children_generated;
       }
       stats_json["gari_monolithic_one_way"] = {
+          {"prior_policy",
+           gari_prior_policy_name(args.gari_two_stage_layout.prior_policy)},
           {"real_detector_count", args.gari_two_stage_layout.physical_detector_count},
           {"virtual_detector_count", args.gari_two_stage_layout.virtual_detector_count},
           {"physical_error_count", args.gari_two_stage_layout.physical_error_count},

@@ -51,3 +51,16 @@ py_test(
     ],
     imports = ["..", "."],
 )
+
+py_test(
+    name = "gari_dem_utils_test",
+    srcs = ["gari_dem_utils_test.py"],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        ":_tesseract_py_util",
+        "@pypi//numpy",
+        "@pypi//pytest",
+        "@pypi//scipy",
+    ],
+    imports = ["..", "."],
+)
