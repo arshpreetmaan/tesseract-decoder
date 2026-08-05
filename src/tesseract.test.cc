@@ -300,11 +300,13 @@ TEST(GariMonolithicOneWayTest, RecordsBottomSearchBreadth) {
   const auto& stats = decoder.gari_monolithic_one_way_stats;
   EXPECT_GT(stats.top_queue_pops, 0);
   EXPECT_GT(stats.bottom_queue_pops, 0);
+  EXPECT_EQ(stats.top_completions_seen, 2);
   EXPECT_EQ(stats.bottom_contexts_generated, 2);
-  EXPECT_EQ(stats.bottom_contexts_explored, 2);
+  EXPECT_EQ(stats.bottom_contexts_explored, 1);
+  EXPECT_EQ(stats.bottom_cache_hits, 1);
   EXPECT_EQ(stats.unique_bottom_debts_explored, 1);
-  EXPECT_GE(stats.bottom_children_generated, 4);
-  EXPECT_GE(stats.bottom_nonprogress_children_generated, 2);
+  EXPECT_GE(stats.bottom_children_generated, 2);
+  EXPECT_GE(stats.bottom_nonprogress_children_generated, 1);
 
   decoder.decode_to_errors({});
   EXPECT_EQ(decoder.gari_monolithic_one_way_stats.top_queue_pops, 0);
@@ -346,6 +348,43 @@ TEST(GariMonolithicOneWayTest, FreezesFirstProjectedTopCompletion) {
     EXPECT_EQ(decoder.gari_monolithic_one_way_stats.bottom_contexts_explored, 1);
     EXPECT_EQ(decoder.gari_monolithic_one_way_stats.unique_bottom_debts_explored, 1);
   }
+}
+
+TEST(GariMonolithicOneWayTest, ContinuesTopQueueUsingPhysicalCostFeedback) {
+  stim::DetectorErrorModel dem(R"DEM(
+    error(0.49) D1 L0
+    error(0.001) D2 L1
+    error(0.1) D0 D1
+    error(0.2) D0 D2
+  )DEM");
+  TesseractConfig config{dem};
+  config.det_beam = 15;
+  config.det_orders = {{0, 1, 2}};
+  config.merge_errors = false;
+  config.no_revisit_dets = true;
+  config.gari_monolithic_one_way = GariMonolithicOneWayConfig{
+      .real_detector_count = 1,
+      .physical_error_count = 2,
+      .bottom_beam = 2,
+      .continuation_factor = 1,
+      .collect_stats = true,
+  };
+  TesseractDecoder decoder(config);
+  decoder.decode_to_errors({0}, 0, 15);
+
+  ASSERT_FALSE(decoder.low_confidence_flag);
+  std::sort(decoder.predicted_errors_buffer.begin(),
+            decoder.predicted_errors_buffer.end());
+  EXPECT_EQ(decoder.predicted_errors_buffer, (std::vector<size_t>{0, 2}));
+  EXPECT_EQ(decoder.get_flipped_observables(decoder.predicted_errors_buffer),
+            (std::vector<int>{0}));
+  EXPECT_EQ(decoder.gari_monolithic_one_way_stats.top_completions_seen, 2);
+  EXPECT_GT(decoder.gari_monolithic_one_way_stats.continuation_top_queue_pops, 0);
+  EXPECT_EQ(
+      decoder.gari_monolithic_one_way_stats.continuation_physical_improvements,
+      1);
+  EXPECT_EQ(decoder.gari_monolithic_one_way_stats.unique_bottom_debts_explored,
+            2);
 }
 
 bool simplex_test_compare(stim::DetectorErrorModel& dem, std::vector<stim::SparseShot>& shots) {

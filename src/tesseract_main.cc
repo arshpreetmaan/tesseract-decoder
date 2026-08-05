@@ -233,6 +233,7 @@ struct Args {
   bool gari_two_stage = false;
   bool gari_monolithic_one_way = false;
   size_t gari_monolithic_bottom_beam = INF_DET_BEAM;
+  double gari_monolithic_continuation_factor = 0;
   bool gari_split_top = false;
   std::string gari_bottom_decoder = "tesseract";
   size_t gari_bottom_beam = 2;
@@ -441,6 +442,11 @@ struct Args {
         throw std::invalid_argument(
             "--gari-monolithic-bottom-beam must be below the infinity sentinel");
       }
+      if (!std::isfinite(gari_monolithic_continuation_factor) ||
+          gari_monolithic_continuation_factor < 0) {
+        throw std::invalid_argument(
+            "--gari-monolithic-continuation-factor must be finite and nonnegative");
+      }
       if (program.is_used("--gari-bottom-decoder") ||
           program.is_used("--gari-bottom-beam") ||
           program.is_used("--gari-bottom-num-det-orders") ||
@@ -449,7 +455,8 @@ struct Args {
             "GARI two-stage bottom and candidate options cannot be used with "
             "--gari-monolithic-one-way");
       }
-    } else if (program.is_used("--gari-monolithic-bottom-beam")) {
+    } else if (program.is_used("--gari-monolithic-bottom-beam") ||
+               program.is_used("--gari-monolithic-continuation-factor")) {
       throw std::invalid_argument(
           "GARI monolithic options require --gari-monolithic-one-way");
     }
@@ -589,6 +596,7 @@ struct Args {
           .real_detector_count = gari_two_stage_layout.physical_detector_count,
           .physical_error_count = gari_two_stage_layout.physical_error_count,
           .bottom_beam = gari_monolithic_bottom_beam,
+          .continuation_factor = gari_monolithic_continuation_factor,
       };
     }
 
@@ -789,8 +797,8 @@ int main(int argc, char* argv[]) {
       .store_into(args.gari_two_stage);
   program.add_argument("--gari-monolithic-one-way")
       .help(
-          "Decode the projected real GARI block to its first completion, freeze its debt, "
-          "then decode the virtual block with physical errors")
+          "Decode the projected real GARI block, materialize debt only at complete top "
+          "states, then decode the virtual block with physical errors")
       .flag()
       .store_into(args.gari_monolithic_one_way);
   program.add_argument("--gari-monolithic-bottom-beam")
@@ -800,6 +808,14 @@ int main(int argc, char* argv[]) {
       .metavar("N")
       .default_value(INF_DET_BEAM)
       .store_into(args.gari_monolithic_bottom_beam);
+  program.add_argument("--gari-monolithic-continuation-factor")
+      .help(
+          "Keep the projected top queue alive after its first completion for "
+          "ceil(F * first-completion top pops) additional pops; a physical-cost "
+          "improvement renews that window (0 keeps first-completion behavior)")
+      .metavar("F")
+      .default_value(0.0)
+      .store_into(args.gari_monolithic_continuation_factor);
   program.add_argument("--gari-split-top")
       .help("Decode the independent GARI D_X and D_Z top blocks separately")
       .flag()
@@ -978,8 +994,8 @@ int main(int argc, char* argv[]) {
       .store_into(args.beam_climbing);
   program.add_argument("--no-revisit-dets")
       .help(
-          "Use no-revisit-dets heuristic (top child only in two-stage mode; full state in "
-          "one-way mode)")
+          "Use no-revisit-dets heuristic (top child only in two-stage mode; phase-local "
+          "projected state in one-way mode)")
       .flag()
       .store_into(args.no_revisit_dets);
 
@@ -1299,9 +1315,17 @@ int main(int argc, char* argv[]) {
       GariMonolithicOneWayStats totals;
       for (size_t i = 0; i < shot; ++i) {
         totals.top_queue_pops += one_way_stats[i].top_queue_pops;
+        totals.top_completions_seen += one_way_stats[i].top_completions_seen;
+        totals.continuation_top_queue_pops +=
+            one_way_stats[i].continuation_top_queue_pops;
+        totals.continuation_physical_improvements +=
+            one_way_stats[i].continuation_physical_improvements;
+        totals.pqlimit_truncated_trials +=
+            one_way_stats[i].pqlimit_truncated_trials;
         totals.bottom_queue_pops += one_way_stats[i].bottom_queue_pops;
         totals.bottom_contexts_generated += one_way_stats[i].bottom_contexts_generated;
         totals.bottom_contexts_explored += one_way_stats[i].bottom_contexts_explored;
+        totals.bottom_cache_hits += one_way_stats[i].bottom_cache_hits;
         totals.unique_bottom_debts_explored +=
             one_way_stats[i].unique_bottom_debts_explored;
         totals.bottom_children_generated += one_way_stats[i].bottom_children_generated;
@@ -1315,7 +1339,11 @@ int main(int argc, char* argv[]) {
           {"barred_error_count", args.gari_two_stage_layout.barred_error_count},
           {"real_detector_order_method", args.detector_order_method_name()},
           {"virtual_detector_order", "natural"},
-          {"top_completion_policy", "first_projected_completion"},
+          {"top_completion_policy",
+           args.gari_monolithic_continuation_factor > 0
+               ? "persistent_soft_wall"
+               : "first_projected_completion"},
+          {"continuation_factor", args.gari_monolithic_continuation_factor},
           {"bottom_beam",
            args.gari_monolithic_bottom_beam < INF_DET_BEAM
                ? nlohmann::json(args.gari_monolithic_bottom_beam)
@@ -1326,9 +1354,15 @@ int main(int argc, char* argv[]) {
                : "projected_real_top"},
           {"final_cost_scope", "physical_errors"},
           {"top_queue_pops", totals.top_queue_pops},
+          {"top_completions_seen", totals.top_completions_seen},
+          {"continuation_top_queue_pops", totals.continuation_top_queue_pops},
+          {"continuation_physical_improvements",
+           totals.continuation_physical_improvements},
+          {"pqlimit_truncated_trials", totals.pqlimit_truncated_trials},
           {"bottom_queue_pops", totals.bottom_queue_pops},
           {"bottom_contexts_generated", totals.bottom_contexts_generated},
           {"bottom_contexts_explored", totals.bottom_contexts_explored},
+          {"bottom_cache_hits", totals.bottom_cache_hits},
           {"total_unique_bottom_debts_across_shots",
            totals.unique_bottom_debts_explored},
           {"average_bottom_queue_pops_per_generated_context",

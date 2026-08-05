@@ -41,7 +41,7 @@ A fixed beam with one top order performs one top-and-bottom pass:
   --stats-out "<fixed-stats>.json"
 ```
 
-For projected first-completion decoding over the full GARI model, use the mapped
+For projected one-way decoding over the full GARI model, use the mapped
 `_ogL_modeN.dem` with `--gari-monolithic-one-way` instead of
 `--gari-two-stage`:
 
@@ -53,17 +53,27 @@ For projected first-completion decoding over the full GARI model, use the mapped
   --sample-num-shots 10 --sample-seed 0 --threads 1 \
   --beam 20 --num-det-orders 16 --det-order-bfs \
   --gari-monolithic-bottom-beam 2 \
+  --gari-monolithic-continuation-factor 1 \
   --pqlimit 1000000 --stats-out "<one-way-stats>.json"
 ```
 
 For each detector-order trial, this mode first runs an independent-style
 Tesseract search on the projected real block. Its state, priority, beam, and
-visited key contain only the real residual. The first zero-real state popped
-from that queue is frozen; all other top states are discarded. Its virtual
-debt is then materialized once and passed to one fresh physical-only bottom
-search in natural detector order. `--gari-monolithic-bottom-beam 2` bounds that
-bottom search; omitting it leaves the bottom beam unbounded. The queue-push
-limit is shared by the two sequential searches.
+visited key contain only the real residual. By default, the first zero-real
+state popped from that queue is frozen and all other top states are discarded.
+Its virtual debt is materialized only at that boundary and passed to a
+physical-only bottom search in natural detector order.
+
+Set `--gari-monolithic-continuation-factor F` to keep the same projected top
+queue alive. If its first completion takes `P0` top queue pops, the decoder
+permits `ceil(F * P0)` additional top pops. A later complete candidate that
+improves the shot's retained original physical cost renews that window;
+otherwise the search stops at its deadline. Exact bottom results are cached by
+debt across the shot's beam/order trials. `F=0` is the default first-completion
+behavior, although repeated debts still reuse cached bottom results.
+`--gari-monolithic-bottom-beam 2` bounds each bottom search; omitting it leaves
+the bottom beam unbounded. The queue-push limit is shared by the persistent top
+search and all uncached bottom searches in a trial.
 
 `--no-revisit-dets` uses the ordinary exact-state rule in both phases: the
 projected real bitset is the top key and the virtual residual bitset is the
@@ -74,7 +84,9 @@ the `_ogL` layout makes observables physical-only. The standard
 options remain available. One-way sparsification retains every physical column
 and sparsifies only eligible barred columns. The `gari_monolithic_one_way`
 statistics block records the layout sizes, queue work by phase, entered bottom
-debt, same-weight bottom branching, ordering policies, and the beam/cost scopes.
+debt, cache hits, top completions, continuation work and improvements,
+queue-limit truncations, same-weight bottom branching, ordering policies, and
+the beam/cost scopes.
 
 For two-stage decoding, add `--beam-climbing` to test beams 0 through 20. Set
 `--num-det-orders 21` to cycle through 21 randomized top index orders during

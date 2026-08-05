@@ -16,6 +16,7 @@
 #define TESSERACT_DECODER_H
 
 #include <boost/dynamic_bitset.hpp>
+#include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -40,14 +41,20 @@ struct GariMonolithicOneWayConfig {
   size_t real_detector_count = 0;
   size_t physical_error_count = 0;
   size_t bottom_beam = INF_DET_BEAM;
+  double continuation_factor = 0;
   bool collect_stats = false;
 };
 
 struct GariMonolithicOneWayStats {
   size_t top_queue_pops = 0;
+  size_t top_completions_seen = 0;
+  size_t continuation_top_queue_pops = 0;
+  size_t continuation_physical_improvements = 0;
+  size_t pqlimit_truncated_trials = 0;
   size_t bottom_queue_pops = 0;
   size_t bottom_contexts_generated = 0;
   size_t bottom_contexts_explored = 0;
+  size_t bottom_cache_hits = 0;
   size_t unique_bottom_debts_explored = 0;
   size_t bottom_children_generated = 0;
   size_t bottom_nonprogress_children_generated = 0;
@@ -176,6 +183,17 @@ struct TesseractDecoder {
                                        int64_t stop_before_error_chain_idx = -1) const;
 
  private:
+  struct DynamicBitsetHash {
+    size_t operator()(const boost::dynamic_bitset<>& bits) const {
+      return boost::hash_value(bits);
+    }
+  };
+
+  struct GariBottomCacheEntry {
+    std::vector<size_t> physical_errors;
+    double physical_cost = 0;
+  };
+
   std::vector<uint64_t> sparse_d2e_detections;
   std::vector<uint8_t> error_is_physical;
   std::vector<std::vector<int>> beam_edets;
@@ -188,7 +206,11 @@ struct TesseractDecoder {
   std::vector<double> gari_detector_cost_cache;
   size_t beam_detector_count = 0;
   bool gari_monolithic_one_way_enabled = false;
-  std::unordered_set<size_t> unique_bottom_debt_hashes;
+  std::unordered_map<boost::dynamic_bitset<>, GariBottomCacheEntry, DynamicBitsetHash>
+      gari_bottom_cache;
+  std::unordered_set<boost::dynamic_bitset<>, DynamicBitsetHash>
+      unique_bottom_debts_explored;
+  double gari_monolithic_physical_incumbent = std::numeric_limits<double>::max();
   int sparse_d2e_reactivate_limit = -1;
   bool sparse_d2e_valid = false;
 
